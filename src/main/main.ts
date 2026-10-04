@@ -993,6 +993,7 @@ function appendBookRow(): void {
   bookRow.dataset.id = BOOK_ID;
   bookRow.append(bookTwistButton(), bookBody());
   bookRow.addEventListener("click", () => void choose(BOOK_ID, false));
+  bookRow.addEventListener("contextmenu", (event) => showBookMenu(event));
   outlineEl.append(bookRow);
 }
 
@@ -1668,6 +1669,25 @@ function showContextMenu(event: MouseEvent, node: TreeNode, ancestors: TreeNode[
   placeContextMenu(event.clientX, event.clientY);
 }
 
+function showBookMenu(event: MouseEvent): void {
+  event.preventDefault();
+  clearBarMenu();
+  fillBookActions();
+  placeContextMenu(event.clientX, event.clientY);
+}
+
+function fillBookActions(): void {
+  contextMenu.replaceChildren();
+  for (const action of bookActions()) appendContextAction(action);
+}
+
+function bookActions(): ContextAction[] {
+  return [
+    { label: "Add text", run: () => addTextAtBook() },
+    { label: "Add folder", run: () => addFolderAtBook() },
+  ];
+}
+
 function fillContextActions(node: TreeNode, ancestors: TreeNode[]): void {
   const actions = contextActions(node, nodeInTrash(node, ancestors));
   contextMenu.replaceChildren();
@@ -1757,6 +1777,66 @@ function appendCommandItem(command: MarkupCommand, mac: boolean): void {
 
 function commandShortcut(accelerator: string | undefined, mac: boolean): string | undefined {
   return accelerator ? formatAccelerator(accelerator, mac) : undefined;
+}
+
+async function addTextAtBook(): Promise<void> {
+  if (!book) return;
+  await insertTextAtBook();
+}
+
+async function insertTextAtBook(): Promise<void> {
+  const title = await askTitle("New text");
+  if (!title) return;
+  await placeTextAtBook(title);
+}
+
+async function placeTextAtBook(title: string): Promise<void> {
+  await flush();
+  const id = await createNode(fs, book!, null, "section", title);
+  book = await loadBook(fs, book!.root);
+  await moveBeforeFirstRoot(id);
+  collapsed.delete(BOOK_ID);
+  editingProse = false;
+  await refresh(id);
+  await choose(id, false);
+}
+
+async function moveBeforeFirstRoot(id: string): Promise<void> {
+  const first = nodeId(rootBesides(id));
+  if (first) await moveNode(fs, book!, id, first, "before");
+}
+
+function rootBesides(id: string): TreeNode | undefined {
+  return bookNodes().find((node) => keptRoot(node, id));
+}
+
+function bookNodes(): TreeNode[] {
+  if (!book) return [];
+  return book.nodes;
+}
+
+function keptRoot(node: TreeNode, id: string): boolean {
+  return node.header.id !== id && !isTrash(node);
+}
+
+async function addFolderAtBook(): Promise<void> {
+  if (!book) return;
+  await insertFolderAtBook();
+}
+
+async function insertFolderAtBook(): Promise<void> {
+  const title = await askTitle("New folder");
+  if (!title) return;
+  await finishFolderAtBook(title);
+}
+
+async function finishFolderAtBook(title: string): Promise<void> {
+  await flush();
+  const id = await createNode(fs, book!, null, "group", title);
+  collapsed.delete(BOOK_ID);
+  editingProse = true;
+  await refresh(id);
+  await choose(id, true);
 }
 
 async function addTextAtTop(parentId: string): Promise<void> {
