@@ -3,6 +3,7 @@ name = "bookwriter"
 version = "0.1.0"
 description = "A small writing application for one long book"
 authors = ["Bookwriter"]
+license = "0BSD"
 edition = "2021"
 
 [lib]
