@@ -3,7 +3,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
 import { makeJpeg, makePng } from "../imageFixtures";
-import { exportPdf, exportPdfWithPictures, expandTabs, loadPictures, markdownToPdf, pictureSources } from "./pdf";
+import { exportChapter } from "./export";
+import { chapterPdf, exportPdf, exportPdfWithPictures, expandTabs, loadPictures, markdownToPdf, pictureSources } from "./pdf";
 import { nodeFs } from "../nodeFs";
 import type { TreeNode } from "../internals/model";
 
@@ -85,6 +86,14 @@ describe("pdf export", () => {
     expect(code.warnings.some((warning) => warning.includes("cannot be shown"))).toBe(false);
   });
 
+  it("draws a greater-than-or-equal and keeps a non-breaking hyphen", () => {
+    const result = markdownToPdf("| Functions with CRAP \u2265 30 | 11 |\n| --- | --- |\n| covered | 0 |\n\nA well\u2011covered function.\n");
+    expect(result.pdf).toContain("(\\263)");
+    expect(result.pdf).toContain("well-covered");
+    expect(result.pdf).not.toContain("?");
+    expect(result.warnings.some((warning) => warning.includes("cannot be shown"))).toBe(false);
+  });
+
   it("keeps a soft break, a forced break, and a horizontal rule", () => {
     const result = markdownToPdf("one\ntwo\n\nthree  \nfour\n\n---\n\nAfter.\n");
     const texts = shown(result.pdf).map((piece) => piece.text);
@@ -157,6 +166,29 @@ describe("pdf export", () => {
     expect(texts.find((piece) => piece.includes("First body."))).toContain("[1]");
     expect(texts.find((piece) => piece.includes("Inside text."))).toContain("[2]");
     expect(texts.find((piece) => piece.includes("Second body."))).toContain("[1]");
+  });
+
+  it("prints one chapter and leaves the rest of the book out", async () => {
+    const inside = node("section", { id: "inside", title: "Inside", unit: "text" }, "Inside text.[^1]\n\n[^1]: Inside note.\n");
+    const first = node("group", { id: "one", title: "First", unit: "chapter" }, "First body.\n", [inside]);
+    const second = node("section", { id: "two", title: "Second", unit: "chapter" }, "Second body.\n");
+    await withBook({}, async (root) => {
+      const chapter = exportChapter([first, second], "two");
+      const result = await chapterPdf(chapter!, nodeFs(), root);
+      const text = shown(result.pdf).map((piece) => piece.text).join("\n");
+      expect(text).toContain("Chapter 2");
+      expect(text).toContain("Second body.");
+      expect(text).not.toContain("First body");
+      expect(text).not.toContain("Inside");
+      expect(result.pdf).toContain("(Second)");
+      expect(result.pages).toBe(1);
+
+      const earlier = await chapterPdf(exportChapter([first, second], "one")!, nodeFs(), root);
+      const earlierText = shown(earlier.pdf).map((piece) => piece.text).join("\n");
+      expect(earlierText).toContain("Chapter 1");
+      expect(earlierText).toContain("Inside note.");
+      expect(earlierText).not.toContain("Second body");
+    });
   });
 
   it("prints a footnote that sits in a heading", () => {

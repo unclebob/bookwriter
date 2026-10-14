@@ -1,6 +1,6 @@
 import { readFileSync } from "node:fs";
 import { describe, expect, it } from "vitest";
-import { exportBook, exportDocxFiles, exportNoteGroups, transformBody } from "./export";
+import { exportBook, exportChapter, exportDocxFiles, exportNoteGroups, transformBody } from "./export";
 import { parseSection, type TreeNode } from "../internals/model";
 
 function node(
@@ -345,6 +345,65 @@ describe("export", () => {
     expect(exported.files.some((file) => file.markdown.includes("Gone."))).toBe(false);
     expect(exported.files[0].markdown).toContain("# Twenty kills per second. {-}");
     expect(exported.files[3].markdown.startsWith('<p class="chapter-number">Chapter 1</p>')).toBe(true);
+  });
+
+  it("exports one chapter with its sections, its book number, and not a nested chapter", () => {
+    const inside = node(
+      "section",
+      { id: "inside", title: "Inside", synopsis: "", status: "draft", role: "body", unit: "text" },
+      "Inside the chapter.\n",
+    );
+    const scene = node(
+      "section",
+      { id: "scene", title: "Scene", synopsis: "", status: "draft", role: "body", unit: "section" },
+      "On the next page.\n",
+    );
+    const nested = node(
+      "section",
+      { id: "nested", title: "Nested", synopsis: "", status: "draft", role: "body", unit: "chapter" },
+      "Nested body.\n",
+    );
+    const first = node(
+      "group",
+      { id: "one", title: "Hello: World?", synopsis: "", status: "draft", role: "body", unit: "chapter" },
+      "Opener.\n",
+      [inside, scene, nested],
+    );
+    const second = node(
+      "section",
+      { id: "two", title: "Second", synopsis: "", status: "draft", role: "body", unit: "chapter" },
+      "Second.\n",
+    );
+    const part = node(
+      "group",
+      { id: "part", title: "The Part", synopsis: "", status: "draft", role: "body", unit: "part" },
+      "Part opener.\n",
+      [first, second],
+    );
+
+    const chapter = exportChapter([part], "one");
+    expect(chapter?.filename).toBe("01-Hello World.pdf");
+    expect(chapter?.title).toBe("Hello: World?");
+    expect(chapter?.markdown).toBe(
+      [
+        '<p class="chapter-number">Chapter 1</p>',
+        "# Hello: World?\n\nOpener.",
+        "## Inside\n\nInside the chapter.",
+        '<div class="page-break"></div>\n\n## Scene\n\nOn the next page.',
+      ].join("\n\n"),
+    );
+    expect(chapter?.markdown).not.toContain("Nested");
+    expect(chapter?.markdown).not.toContain("Second");
+    expect(chapter?.markdown).not.toContain("Part opener");
+
+    const later = exportChapter([part], "two");
+    expect(later?.filename).toBe("03-Second.pdf");
+    expect(later?.markdown.startsWith('<p class="chapter-number">Chapter 3</p>')).toBe(true);
+    expect(later?.markdown).toContain("# Second\n\nSecond.");
+    expect(later?.markdown).not.toContain("Opener");
+
+    expect(exportChapter([part], "part")).toBeNull();
+    expect(exportChapter([part], "missing")).toBeNull();
   });
 
   it("keeps a one-character front heading and a one-character body", () => {

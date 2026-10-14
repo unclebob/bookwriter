@@ -1,7 +1,7 @@
 import MarkdownIt from "markdown-it";
 import footnote from "markdown-it-footnote";
 import type { Fs } from "../internals/book";
-import { CHAPTER_NUMBER_CLASS, PAGE_BREAK_CLASS, exportNoteGroups } from "./export";
+import { CHAPTER_NUMBER_CLASS, PAGE_BREAK_CLASS, exportNoteGroups, type ChapterExport } from "./export";
 import type { TreeNode } from "../internals/model";
 import { bookPicturePath } from "../internals/pictures";
 import { joinPath } from "../internals/path";
@@ -118,6 +118,7 @@ function markByte(cp: number): number | undefined {
   if (cp === 0x23fa) return 0x95; // ⏺ the reply mark, drawn as •
   if (cp === 0x23bf) return 0x60; // ⎿ the result elbow, drawn as `
   if (cp === 0x2212) return 0x2d; // − minus sign, drawn as -
+  if (cp === 0x2011) return 0x2d; // ‑ non-breaking hyphen, drawn as -
   return undefined;
 }
 
@@ -149,7 +150,7 @@ function encode(text: string): number[] {
 function hasUnshownCharacter(text: string): boolean {
   for (const char of text.normalize("NFC")) {
     const cp = char.codePointAt(0)!;
-    if (cp === 10 || cp === 13 || cp === 0x03c0 || cp === 0x03a0) continue;
+    if (cp === 10 || cp === 13 || cp === 0x03c0 || cp === 0x03a0 || cp === 0x2265) continue;
     if (raisedDigit(cp) !== undefined) continue;
     if (winAnsiByte(cp) === null) return true;
   }
@@ -233,6 +234,11 @@ function glyphs(text: string, font: FontKey): Glyph[] {
     }
     if (cp === 0x03a0) {
       out.push({ code: 0x50, font: "F6" });
+      continue;
+    }
+    // ≥ has no glyph in the text fonts. Symbol draws it at byte 0xB3.
+    if (cp === 0x2265) {
+      out.push({ code: 0xb3, font: "F6" });
       continue;
     }
     out.push({ code: winAnsiByte(cp) ?? 63, font });
@@ -1374,6 +1380,17 @@ export async function exportPdfWithPictures(
   const exported = exportNoteGroups(nodes);
   const pictures = await loadPictures(fs, root, exported.groups.join("\n\n"), options);
   return mergeWarnings(renderGroups(exported.groups, title, pictures), exported.warnings);
+}
+
+/** A PDF of one chapter. Pictures are read from the book folder. */
+export async function chapterPdf(
+  chapter: ChapterExport,
+  fs: Fs,
+  root: string,
+  options: EncodeOptions = {},
+): Promise<PdfResult> {
+  const pictures = await loadPictures(fs, root, chapter.markdown, options);
+  return mergeWarnings(markdownToPdf(chapter.markdown, chapter.title, pictures), chapter.warnings);
 }
 
 function renderGroups(groups: string[], title: string, pictures?: Pictures): PdfResult {

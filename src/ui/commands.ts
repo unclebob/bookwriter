@@ -51,6 +51,40 @@ export type EditResult = {
   head: number;
 };
 
+export type TextSpan = {
+  from: number;
+  to: number;
+  insert: string;
+};
+
+/**
+ * The shortest edit that turns `before` into `after`.
+ * Replacing the whole document maps the editor's scroll anchor to the start.
+ */
+export function changedSpan(before: string, after: string): TextSpan {
+  const from = commonPrefix(before, after);
+  const tail = commonSuffix(before, after, from);
+  return { from, to: before.length - tail, insert: after.slice(from, after.length - tail) };
+}
+
+function commonPrefix(before: string, after: string): number {
+  const limit = Math.min(before.length, after.length);
+  let index = 0;
+  while (index < limit && before[index] === after[index]) index += 1;
+  return index;
+}
+
+function commonSuffix(before: string, after: string, prefix: number): number {
+  const limit = Math.min(before.length, after.length) - prefix;
+  let index = 0;
+  while (index < limit && tailMatches(before, after, index)) index += 1;
+  return index;
+}
+
+function tailMatches(before: string, after: string, index: number): boolean {
+  return before[before.length - 1 - index] === after[after.length - 1 - index];
+}
+
 function clamp(text: string, index: number): number {
   return Math.max(0, Math.min(index, text.length));
 }

@@ -5,6 +5,7 @@ import {
   divisions,
   effectiveFront,
   effectiveUnit,
+  findNode,
   insideSpan,
   startsNewPage,
   stepFence,
@@ -275,6 +276,65 @@ function joinGroup(group: NoteGroup): string {
 }
 
 export type DocxFile = { name: string; markdown: string };
+
+export type ChapterExport = {
+  markdown: string;
+  warnings: string[];
+  title: string;
+  filename: string;
+};
+
+/** One chapter and the sections inside it, numbered as in the whole book. A nested chapter is left out. */
+export function exportChapter(nodes: TreeNode[], id: string): ChapterExport | null {
+  const node = chapterNode(nodes, id);
+  if (!node) return null;
+  const warnings: string[] = [];
+  const numbered = divisions(nodes);
+  return {
+    markdown: chapterMarkdown(node, warnings, numbered),
+    warnings,
+    title: node.header.title,
+    filename: `${docxStem(node, numbered)}.pdf`,
+  };
+}
+
+function chapterNode(nodes: TreeNode[], id: string): TreeNode | null {
+  const found = findNode(withoutTrash(nodes), id);
+  if (!found || !isChapter(found.node)) return null;
+  return found.node;
+}
+
+function chapterMarkdown(node: TreeNode, warnings: string[], numbered: Map<string, Division>): string {
+  return chapterPieces(node, warnings, numbered).map(pieceText).join("\n\n");
+}
+
+function chapterPieces(node: TreeNode, warnings: string[], numbered: Map<string, Division>): Piece[] {
+  const pieces = [ownPiece(node, [], warnings, numbered, false)];
+  addChapterChildren(pieces, node.children, [node], warnings, numbered);
+  return pieces;
+}
+
+function addChapterChildren(
+  pieces: Piece[],
+  nodes: TreeNode[],
+  ancestors: TreeNode[],
+  warnings: string[],
+  numbered: Map<string, Division>,
+): void {
+  for (const node of nodes) addChapterChild(pieces, node, ancestors, warnings, numbered);
+}
+
+function addChapterChild(
+  pieces: Piece[],
+  node: TreeNode,
+  ancestors: TreeNode[],
+  warnings: string[],
+  numbered: Map<string, Division>,
+): void {
+  if (isChapter(node)) return;
+  pieces.push(ownPiece(node, ancestors, warnings, numbered, true));
+  addChapterChildren(pieces, node.children, [...ancestors, node], warnings, numbered);
+}
 
 /** One Word file for each front-matter piece, and one for each chapter. Parts are not files. */
 export function exportDocxFiles(nodes: TreeNode[]): { files: DocxFile[]; warnings: string[] } {

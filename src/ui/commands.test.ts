@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { COMMANDS, applyCommand, latestLanguage } from "./commands";
+import { COMMANDS, applyCommand, changedSpan, latestLanguage } from "./commands";
 
 describe("markup commands", () => {
   it("lists the twelve constructs, and foot finds Footnote", () => {
@@ -119,5 +119,20 @@ describe("markup commands", () => {
     const edited = applyCommand("footnote", text, text.length, text.length);
     expect(edited.text).toBe("Hello [^1] there.\n\n[^1]: First.\n[^2]\n\n[^2]: ");
     expect(edited.head).toBe(edited.text.length);
+  });
+
+  it("limits an emphasis edit to the selection, leaving the text around it", () => {
+    const before = "Keep this.\nChange me.\nKeep that.";
+    const edited = applyCommand("emphasis", before, 11, 21);
+    const span = changedSpan(before, edited.text);
+    expect(span).toEqual({ from: 11, to: 21, insert: "*Change me.*" });
+    expect(before.slice(0, span.from) + span.insert + before.slice(span.to)).toBe(edited.text);
+  });
+
+  it("finds an edit at either end, and an empty edit when the text matches", () => {
+    expect(changedSpan("same", "same")).toEqual({ from: 4, to: 4, insert: "" });
+    expect(changedSpan("tail", "head\ntail")).toEqual({ from: 0, to: 0, insert: "head\n" });
+    expect(changedSpan("head", "head\ntail")).toEqual({ from: 4, to: 4, insert: "\ntail" });
+    expect(changedSpan("abc", "xyz")).toEqual({ from: 0, to: 3, insert: "xyz" });
   });
 });

@@ -22,10 +22,10 @@ import {
   type Book,
   type DropZone,
 } from "../internals/book";
-import { COMMANDS, applyCommand, latestLanguage, type CommandId, type MarkupCommand } from "../ui/commands";
-import { exportBook, exportDocxFiles } from "../export/export";
+import { COMMANDS, applyCommand, changedSpan, latestLanguage, type CommandId, type MarkupCommand } from "../ui/commands";
+import { exportBook, exportChapter, exportDocxFiles, type ChapterExport } from "../export/export";
 import { nextMatch, previousMatch, type FindHit, type FindPart } from "../ui/find";
-import { exportPdfWithPictures } from "../export/pdf";
+import { chapterPdf, exportPdfWithPictures } from "../export/pdf";
 import { rasterizePicture } from "../ui/rasterize";
 import { formatAccelerator } from "../ui/keys";
 import { blockAtLine, lineOffset, offsetFraction, scrollToSpot, sourceOffset } from "../ui/locate";
@@ -145,6 +145,7 @@ const editorExtensions = [
     { key: "Mod-b", run: () => (runCommand("strong"), true) },
     { key: "Mod-i", run: () => (runCommand("emphasis"), true) },
     { key: "Mod-e", run: () => (runCommand("inline-code"), true) },
+    { key: "Mod-r", run: () => (refreshDisplay(), true) },
     { key: "Mod-z", run: () => requestHistory("undo"), preventDefault: true },
     { key: "Mod-y", mac: "Mod-Shift-z", run: () => requestHistory("redo"), preventDefault: true },
     { linux: "Ctrl-Shift-z", run: () => requestHistory("redo"), preventDefault: true },
@@ -271,7 +272,15 @@ function documentUnchanged(body: string, resetHistory: boolean): boolean {
 
 function replaceDocument(body: string, resetHistory: boolean): void {
   if (resetHistory) editor.setState(EditorState.create({ doc: body, extensions: editorExtensions }));
-  else editor.dispatch({ changes: { from: 0, to: editor.state.doc.length, insert: body } });
+  else replaceKeptBody(body);
+}
+
+/** A disk reload is not an edit, and the viewport stays on the same place in the text. */
+function replaceKeptBody(body: string): void {
+  editor.dispatch({
+    changes: changedSpan(editor.state.doc.toString(), body),
+    annotations: Transaction.addToHistory.of(false),
+  });
 }
 
 function takeVisit(): Visit | null {
@@ -1318,6 +1327,7 @@ async function reloadBook(keep: string | null, resetHistory: boolean): Promise<v
   const changed = selectionChanged(resetHistory, previousId, previousProse);
   if (changed) trail = emptyTrail();
   bookTitle.value = loaded.title;
+  document.title = titled(loaded.title);
   loadRefreshedDocument(changed);
   renderOutline();
   fillInspector();
@@ -1416,6 +1426,45 @@ async function openFolder(): Promise<void> {
   if (typeof picked === "string") await openRoot(picked);
 }
 
+let refreshing = false;
+
+function refreshDisplay(): void {
+  if (book == null || refreshing) return;
+  refreshing = true;
+  void finishRefresh();
+}
+
+async function finishRefresh(): Promise<void> {
+  try {
+    await showDisk();
+  } catch (error) {
+    showWarnings([`The book could not be read. ${String(error)}`]);
+  } finally {
+    refreshing = false;
+  }
+}
+
+/** Read the files again. The open buffer is not written first, so an outside edit is what shows. */
+async function showDisk(): Promise<void> {
+  if (!book) return;
+  cancelSave();
+  try {
+    await refresh(selectedId ?? BOOK_ID);
+  } catch (error) {
+    resumeSave();
+    throw error;
+  }
+  // A parked visit still holds the buffer from before this read. Undo would write it back.
+  trail = emptyTrail();
+  markSaved();
+  if (editing()) editor.focus();
+}
+
+function resumeSave(): void {
+  if (!dirty) return;
+  saveTimer = window.setTimeout(() => void flush(), 400);
+}
+
 function bookParent(): string | undefined {
   return book ? parentPath(book.root) : undefined;
 }
@@ -1483,6 +1532,48 @@ async function safePdfExport(): Promise<void> {
 
 async function writePdfFile(destination: string): Promise<void> {
   const result = await exportPdfWithPictures(manuscriptNodes(book!.nodes), book!.title, fs, book!.root, { rasterize: rasterizePicture });
+  await fs.writeText(destination, result.pdf);
+  showWarnings(result.warnings);
+  saveState.textContent = exportStatus(result.warnings.length);
+}
+
+async function exportThisChapter(id: string): Promise<void> {
+  if (!book) return;
+  try {
+    await saveChapterPdf(id);
+  } catch (error) {
+    showWarnings([`PDF export failed: ${String(error)}`]);
+    saveState.textContent = "Export failed";
+  }
+}
+
+async function saveChapterPdf(id: string): Promise<void> {
+  const loaded = await flushedBook();
+  const chapter = exportChapter(manuscriptNodes(loaded.nodes), id);
+  if (!chapter) {
+    missingChapter();
+    return;
+  }
+  const destination = await chooseChapterPdf(loaded.root, chapter.filename);
+  if (typeof destination !== "string") return;
+  await writeChapterPdf(destination, chapter);
+}
+
+function missingChapter(): void {
+  showWarnings(["That chapter is not in the book."]);
+  saveState.textContent = "Export failed";
+}
+
+function chooseChapterPdf(root: string, filename: string) {
+  return save({
+    title: "Export chapter to PDF",
+    defaultPath: joinPath(root, filename),
+    filters: [{ name: "PDF", extensions: ["pdf"] }],
+  });
+}
+
+async function writeChapterPdf(destination: string, chapter: ChapterExport): Promise<void> {
+  const result = await chapterPdf(chapter, fs, book!.root, { rasterize: rasterizePicture });
   await fs.writeText(destination, result.pdf);
   showWarnings(result.warnings);
   saveState.textContent = exportStatus(result.warnings.length);
@@ -1705,7 +1796,16 @@ function contextActions(node: TreeNode, inTrash: boolean): ContextAction[] {
 
 function rowActions(node: TreeNode, inTrash: boolean): ContextAction[] {
   const actions = node.kind === "group" ? groupActions(node) : sectionActions(node);
-  return withDelete(actions, node, inTrash);
+  return withDelete(withChapterPdf(actions, node, inTrash), node, inTrash);
+}
+
+function withChapterPdf(actions: ContextAction[], node: TreeNode, inTrash: boolean): ContextAction[] {
+  if (skipChapterPdf(node, inTrash)) return actions;
+  return [...actions, { label: "Export to PDF", run: () => exportThisChapter(node.header.id) }];
+}
+
+function skipChapterPdf(node: TreeNode, inTrash: boolean): boolean {
+  return inTrash || effectiveUnit(node) !== "chapter";
 }
 
 function trashActions(): ContextAction[] {
@@ -2096,9 +2196,13 @@ function applyEditingCommand(id: CommandId): void {
   if (!editing()) return;
   const range = editor.state.selection.main;
   const result = applyCommand(id, editor.state.doc.toString(), range.anchor, range.head, latestLanguage(commandBodies()));
+  dispatchEdit(result.text, result.anchor, result.head);
+}
+
+function dispatchEdit(text: string, anchor: number, head: number): void {
   editor.dispatch({
-    changes: { from: 0, to: editor.state.doc.length, insert: result.text },
-    selection: { anchor: result.anchor, head: result.head },
+    changes: changedSpan(editor.state.doc.toString(), text),
+    selection: { anchor, head },
   });
   editor.focus();
 }
@@ -2163,11 +2267,7 @@ async function movedPicture(root: string, picked: string): Promise<string | null
 function dispatchPicture(relative: string): void {
   const range = editor.state.selection.main;
   const result = applyCommand("picture", editor.state.doc.toString(), range.anchor, range.head, "", relative);
-  editor.dispatch({
-    changes: { from: 0, to: editor.state.doc.length, insert: result.text },
-    selection: { anchor: result.anchor, head: result.head },
-  });
-  editor.focus();
+  dispatchEdit(result.text, result.anchor, result.head);
 }
 
 function matchingCommands(): typeof COMMANDS {
@@ -2622,6 +2722,7 @@ async function installMenu(): Promise<void> {
         text: "File",
         items: [
           await MenuItem.new({ id: "open", text: "Open Book…", accelerator: "CmdOrCtrl+O", action: () => void openFolder() }),
+          await MenuItem.new({ id: "refresh", text: "Refresh", accelerator: "CmdOrCtrl+R", action: refreshDisplay }),
           await MenuItem.new({ id: "export", text: "Export Manuscript…", accelerator: "CmdOrCtrl+Shift+E", action: () => void exportManuscript() }),
           await MenuItem.new({ id: "export-pdf", text: "Export PDF…", action: () => void exportPdfManuscript() }),
           await MenuItem.new({ id: "export-docx", text: "Export Chapters to Word…", action: () => void exportDocxManuscript() }),
@@ -2673,6 +2774,7 @@ const macShortcuts = usesMacShortcuts();
 fileButton.addEventListener("pointerdown", (event) => {
   toggleBarMenu(event, fileButton, [
     { label: "Open", shortcut: formatAccelerator("CmdOrCtrl+O", macShortcuts), run: () => void openFolder() },
+    { label: "Refresh", shortcut: formatAccelerator("CmdOrCtrl+R", macShortcuts), run: refreshDisplay },
     { label: "Export", shortcut: formatAccelerator("CmdOrCtrl+Shift+E", macShortcuts), run: () => void exportManuscript() },
     { label: "Export PDF", run: () => void exportPdfManuscript() },
     { label: "Export Word", run: () => void exportDocxManuscript() },
