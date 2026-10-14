@@ -363,11 +363,16 @@ describe("export", () => {
       { id: "nested", title: "Nested", synopsis: "", status: "draft", role: "body", unit: "chapter" },
       "Nested body.\n",
     );
+    const after = node(
+      "section",
+      { id: "after", title: "After", synopsis: "", status: "draft", role: "body", unit: "text" },
+      "After the nested chapter.\n",
+    );
     const first = node(
       "group",
       { id: "one", title: "Hello: World?", synopsis: "", status: "draft", role: "body", unit: "chapter" },
       "Opener.\n",
-      [inside, scene, nested],
+      [inside, scene, nested, after],
     );
     const second = node(
       "section",
@@ -390,6 +395,7 @@ describe("export", () => {
         "# Hello: World?\n\nOpener.",
         "## Inside\n\nInside the chapter.",
         '<div class="page-break"></div>\n\n## Scene\n\nOn the next page.',
+        "## After\n\nAfter the nested chapter.",
       ].join("\n\n"),
     );
     expect(chapter?.markdown).not.toContain("Nested");

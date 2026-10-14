@@ -1448,20 +1448,26 @@ async function finishRefresh(): Promise<void> {
 async function showDisk(): Promise<void> {
   if (!book) return;
   cancelSave();
+  navigating = true;
   try {
     await refresh(selectedId ?? BOOK_ID);
   } catch (error) {
     resumeSave();
     throw error;
+  } finally {
+    navigating = false;
   }
+  cancelSave();
   // A parked visit still holds the buffer from before this read. Undo would write it back.
   trail = emptyTrail();
-  markSaved();
+  if (dirty) resumeSave();
+  else markSaved();
   if (editing()) editor.focus();
 }
 
 function resumeSave(): void {
   if (!dirty) return;
+  saveState.textContent = "Unsaved";
   saveTimer = window.setTimeout(() => void flush(), 400);
 }
 

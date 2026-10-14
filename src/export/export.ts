@@ -122,7 +122,7 @@ type NoteGroup = { key: string; parts: string[] };
  */
 export function exportNoteGroups(nodes: TreeNode[]): { groups: string[]; warnings: string[] } {
   const warnings: string[] = [];
-  const pieces = collectPieces(withoutTrash(nodes), [], warnings, divisions(nodes), false);
+  const pieces = walkPieces(withoutTrash(nodes), [], warnings, divisions(nodes), false, "enter");
   return { groups: packGroups(pieces), warnings };
 }
 
@@ -139,38 +139,30 @@ function keptNode(node: TreeNode): boolean {
   return node.header.id !== "trash";
 }
 
-function collectPieces(
+type NestedChapter = "enter" | "omit";
+
+function walkPieces(
   nodes: TreeNode[],
   ancestors: TreeNode[],
   warnings: string[],
   numbered: Map<string, Division>,
   followed: boolean,
+  nested: NestedChapter,
 ): Piece[] {
   const pieces: Piece[] = [];
-  nodes.forEach((node, index) => addNode(pieces, node, ancestors, warnings, numbered, followed || index > 0));
+  for (let index = 0; index < nodes.length; index += 1) {
+    const node = nodes[index];
+    if (nested === "omit" && ancestors.length > 0 && isChapter(node)) continue;
+    pieces.push(ownPiece(node, ancestors, warnings, numbered, followed || index > 0));
+    pieces.push(...walkPieces(node.children, [...ancestors, node], warnings, numbered, true, nested));
+  }
   return pieces;
 }
 
-function addNode(
-  pieces: Piece[],
-  node: TreeNode,
-  ancestors: TreeNode[],
-  warnings: string[],
-  numbered: Map<string, Division>,
-  followed: boolean,
-): void {
-  pieces.push(ownPiece(node, ancestors, warnings, numbered, followed));
-  addChildren(pieces, node, ancestors, warnings, numbered);
-}
-
-function addChildren(
-  pieces: Piece[],
-  node: TreeNode,
-  ancestors: TreeNode[],
-  warnings: string[],
-  numbered: Map<string, Division>,
-): void {
-  pieces.push(...collectPieces(node.children, [...ancestors, node], warnings, numbered, true));
+function markdownOf(node: TreeNode, warnings: string[], numbered: Map<string, Division>, nested: NestedChapter): string {
+  return walkPieces([node], [], warnings, numbered, false, nested)
+    .map((piece) => piece.markdown)
+    .join("\n\n");
 }
 
 function ownPiece(
@@ -291,7 +283,7 @@ export function exportChapter(nodes: TreeNode[], id: string): ChapterExport | nu
   const warnings: string[] = [];
   const numbered = divisions(nodes);
   return {
-    markdown: chapterMarkdown(node, warnings, numbered),
+    markdown: markdownOf(node, warnings, numbered, "omit"),
     warnings,
     title: node.header.title,
     filename: `${docxStem(node, numbered)}.pdf`,
@@ -302,38 +294,6 @@ function chapterNode(nodes: TreeNode[], id: string): TreeNode | null {
   const found = findNode(withoutTrash(nodes), id);
   if (!found || !isChapter(found.node)) return null;
   return found.node;
-}
-
-function chapterMarkdown(node: TreeNode, warnings: string[], numbered: Map<string, Division>): string {
-  return chapterPieces(node, warnings, numbered).map(pieceText).join("\n\n");
-}
-
-function chapterPieces(node: TreeNode, warnings: string[], numbered: Map<string, Division>): Piece[] {
-  const pieces = [ownPiece(node, [], warnings, numbered, false)];
-  addChapterChildren(pieces, node.children, [node], warnings, numbered);
-  return pieces;
-}
-
-function addChapterChildren(
-  pieces: Piece[],
-  nodes: TreeNode[],
-  ancestors: TreeNode[],
-  warnings: string[],
-  numbered: Map<string, Division>,
-): void {
-  for (const node of nodes) addChapterChild(pieces, node, ancestors, warnings, numbered);
-}
-
-function addChapterChild(
-  pieces: Piece[],
-  node: TreeNode,
-  ancestors: TreeNode[],
-  warnings: string[],
-  numbered: Map<string, Division>,
-): void {
-  if (isChapter(node)) return;
-  pieces.push(ownPiece(node, ancestors, warnings, numbered, true));
-  addChapterChildren(pieces, node.children, [...ancestors, node], warnings, numbered);
 }
 
 /** One Word file for each front-matter piece, and one for each chapter. Parts are not files. */
@@ -403,15 +363,7 @@ function pushDocx(
 }
 
 function docxFile(used: Set<string>, node: TreeNode, warnings: string[], numbered: Map<string, Division>): DocxFile {
-  return { name: uniqueDocxName(used, docxName(node, numbered)), markdown: docxMarkdown(node, warnings, numbered) };
-}
-
-function docxMarkdown(node: TreeNode, warnings: string[], numbered: Map<string, Division>): string {
-  return collectPieces([node], [], warnings, numbered, false).map(pieceText).join("\n\n");
-}
-
-function pieceText(piece: Piece): string {
-  return piece.markdown;
+  return { name: uniqueDocxName(used, docxName(node, numbered)), markdown: markdownOf(node, warnings, numbered, "enter") };
 }
 
 function docxName(node: TreeNode, numbered: Map<string, Division>): string {

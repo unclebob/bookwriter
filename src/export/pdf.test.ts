@@ -94,6 +94,13 @@ describe("pdf export", () => {
     expect(result.warnings.some((warning) => warning.includes("cannot be shown"))).toBe(false);
   });
 
+  it("draws a symbol in prose and replaces that symbol inside a fence", () => {
+    const result = markdownToPdf("\u2265\n\n```\n\u2265\n```\n");
+    expect(result.pdf).toContain("(\\263)");
+    expect(result.pdf).toContain("(?)");
+    expect(result.warnings.some((warning) => warning.includes("cannot be shown"))).toBe(false);
+  });
+
   it("keeps a soft break, a forced break, and a horizontal rule", () => {
     const result = markdownToPdf("one\ntwo\n\nthree  \nfour\n\n---\n\nAfter.\n");
     const texts = shown(result.pdf).map((piece) => piece.text);

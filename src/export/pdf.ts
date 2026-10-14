@@ -113,48 +113,98 @@ function boxAscii(cp: number): number | undefined {
   return boxDiagonal(cp) ?? 0x2b;
 }
 
-function markByte(cp: number): number | undefined {
-  if (cp === 0x276f) return 0x9b; // ❯ the prompt angle, drawn as ›
-  if (cp === 0x23fa) return 0x95; // ⏺ the reply mark, drawn as •
-  if (cp === 0x23bf) return 0x60; // ⎿ the result elbow, drawn as `
-  if (cp === 0x2212) return 0x2d; // − minus sign, drawn as -
-  if (cp === 0x2011) return 0x2d; // ‑ non-breaking hyphen, drawn as -
-  return undefined;
+type Paint =
+  | { kind: "same"; byte: number }
+  | { kind: "symbol"; byte: number; width: number }
+  | { kind: "rise"; byte: number };
+
+type PaintRow = { cp: number } & Paint;
+
+const RISE = 0.35;
+const RISE_SCALE = 0.6;
+const MISSING_BYTE = 63;
+const SYMBOL_FALLBACK_WIDTH = 556;
+
+/** U+2070 and U+2074 through U+2079. U+00B9, U+00B2, and U+00B3 are already Latin-1. */
+function raisedRows(): PaintRow[] {
+  const rows: PaintRow[] = [{ cp: 0x2070, kind: "rise", byte: 0x30 }];
+  for (let cp = 0x2074; cp <= 0x2079; cp += 1) rows.push({ cp, kind: "rise", byte: 0x30 + (cp - 0x2070) });
+  return rows;
 }
 
-/** WinAnsi byte for one character, or null when the standard fonts cannot show it as itself. */
-function winAnsiByte(cp: number): number | null {
-  const drawn = boxAscii(cp) ?? markByte(cp);
-  if (drawn !== undefined) return drawn;
-  if (cp === 9) return 32;
-  if (cp >= 32 && cp <= 126) return cp;
-  if (cp >= 160 && cp <= 255) return cp;
+// Symbol bytes are not WinAnsi. A same-font row is drawn as that byte, including inside a fence.
+const PAINT_ROWS: readonly PaintRow[] = [
+  { cp: 0x03c0, kind: "symbol", byte: 0x70, width: 549 },
+  { cp: 0x03a0, kind: "symbol", byte: 0x50, width: 614 },
+  { cp: 0x2265, kind: "symbol", byte: 0xb3, width: 556 },
+  { cp: 0x276f, kind: "same", byte: 0x9b }, // ❯ the prompt angle, drawn as ›
+  { cp: 0x23fa, kind: "same", byte: 0x95 }, // ⏺ the reply mark, drawn as •
+  { cp: 0x23bf, kind: "same", byte: 0x60 }, // ⎿ the result elbow, drawn as `
+  { cp: 0x2212, kind: "same", byte: 0x2d }, // − minus sign, drawn as -
+  { cp: 0x2011, kind: "same", byte: 0x2d }, // ‑ non-breaking hyphen, drawn as -
+  ...raisedRows(),
+];
+
+type PaintIndex = {
+  byCodePoint: ReadonlyMap<number, Paint>;
+  symbolWidth: ReadonlyMap<number, number>;
+};
+
+function paintIndex(rows: readonly PaintRow[]): PaintIndex {
+  const byCodePoint = new Map<number, Paint>();
+  const symbolWidth = new Map<number, number>();
+  for (const row of rows) addPaintRow(byCodePoint, symbolWidth, row);
+  return { byCodePoint, symbolWidth };
+}
+
+function addPaintRow(byCodePoint: Map<number, Paint>, symbolWidth: Map<number, number>, row: PaintRow): void {
+  if (byCodePoint.has(row.cp)) throw new Error(`paint row U+${row.cp.toString(16)} is repeated`);
+  if (boxAscii(row.cp) !== undefined) throw new Error(`paint row U+${row.cp.toString(16)} is box drawing`);
+  byCodePoint.set(row.cp, row);
+  if (row.kind === "symbol") addSymbolWidth(symbolWidth, row.byte, row.width);
+}
+
+function addSymbolWidth(widths: Map<number, number>, byte: number, width: number): void {
+  const prior = widths.get(byte);
+  if (prior !== undefined && prior !== width) throw new Error(`symbol byte ${byte.toString(16)} has two widths`);
+  widths.set(byte, width);
+}
+
+const INDEX: PaintIndex = paintIndex(PAINT_ROWS);
+
+function identityPaint(cp: number): Paint | null {
+  if (cp === 9) return { kind: "same", byte: 32 };
+  if (cp >= 32 && cp <= 126) return { kind: "same", byte: cp };
+  if (cp >= 160 && cp <= 255) return { kind: "same", byte: cp };
   const mapped = WIN_ANSI[cp];
-  return mapped === undefined ? null : mapped;
+  return mapped === undefined ? null : { kind: "same", byte: mapped };
 }
 
-/** ⁰ and ⁴–⁹ have no superscript glyph in the text fonts. The digit is drawn smaller and raised. */
-function raisedDigit(cp: number): number | undefined {
-  if (cp === 0x2070) return 0x30;
-  if (cp >= 0x2074 && cp <= 0x2079) return 0x30 + (cp - 0x2070);
-  return undefined;
+function paintOf(cp: number): Paint | null {
+  const row = INDEX.byCodePoint.get(cp);
+  if (row) return row;
+  const box = boxAscii(cp);
+  if (box !== undefined) return { kind: "same", byte: box };
+  return identityPaint(cp);
 }
 
-/** Map text to single-byte WinAnsi codes; anything outside that set becomes "?". A tab is one space here; code expands tabs first. */
+function flatByte(cp: number): number {
+  const paint = paintOf(cp);
+  return paint?.kind === "same" ? paint.byte : MISSING_BYTE;
+}
+
+function codePoints(text: string): number[] {
+  const points: number[] = [];
+  for (const char of text.normalize("NFC")) points.push(char.codePointAt(0)!);
+  return points;
+}
+
 function encode(text: string): number[] {
-  const codes: number[] = [];
-  for (const char of text.normalize("NFC")) codes.push(winAnsiByte(char.codePointAt(0)!) ?? 63);
-  return codes;
+  return codePoints(text).map(flatByte);
 }
 
 function hasUnshownCharacter(text: string): boolean {
-  for (const char of text.normalize("NFC")) {
-    const cp = char.codePointAt(0)!;
-    if (cp === 10 || cp === 13 || cp === 0x03c0 || cp === 0x03a0 || cp === 0x2265) continue;
-    if (raisedDigit(cp) !== undefined) continue;
-    if (winAnsiByte(cp) === null) return true;
-  }
-  return false;
+  return codePoints(text).some((cp) => cp !== 10 && cp !== 13 && paintOf(cp) == null);
 }
 
 /** Replace tabs with spaces up to the next multiple of `stop` columns, so indentation lines up. */
@@ -186,7 +236,7 @@ function pdfString(codes: number[]): string {
 
 function glyphWidth(code: number, font: FontKey): number {
   if (font === "F3") return 600;
-  if (font === "F6") return code === 0x70 ? 549 : code === 0x50 ? 614 : 556;
+  if (font === "F6") return INDEX.symbolWidth.get(code) ?? SYMBOL_FALLBACK_WIDTH;
   const table = font === "F2" || font === "F5" ? HELVETICA_BOLD : HELVETICA;
   return code >= 32 && code <= 126 ? table[code - 32] : 556;
 }
@@ -218,32 +268,20 @@ function append(line: Piece[], piece: Piece): void {
 
 type Glyph = { code: number; font: FontKey; rise?: number; scale?: number };
 
-/** Characters of one run. Pi uses Symbol. A missing superscript digit is a raised digit. */
 function glyphs(text: string, font: FontKey): Glyph[] {
-  const out: Glyph[] = [];
-  for (const char of text.normalize("NFC")) {
-    const cp = char.codePointAt(0)!;
-    const digit = raisedDigit(cp);
-    if (digit !== undefined) {
-      out.push({ code: digit, font, rise: 0.35, scale: 0.6 });
-      continue;
-    }
-    if (cp === 0x03c0) {
-      out.push({ code: 0x70, font: "F6" });
-      continue;
-    }
-    if (cp === 0x03a0) {
-      out.push({ code: 0x50, font: "F6" });
-      continue;
-    }
-    // ≥ has no glyph in the text fonts. Symbol draws it at byte 0xB3.
-    if (cp === 0x2265) {
-      out.push({ code: 0xb3, font: "F6" });
-      continue;
-    }
-    out.push({ code: winAnsiByte(cp) ?? 63, font });
+  return codePoints(text).map((cp) => glyphFrom(paintOf(cp), font));
+}
+
+function glyphFrom(paint: Paint | null, font: FontKey): Glyph {
+  if (paint == null) return { code: MISSING_BYTE, font };
+  switch (paint.kind) {
+    case "same":
+      return { code: paint.byte, font };
+    case "symbol":
+      return { code: paint.byte, font: "F6" };
+    case "rise":
+      return { code: paint.byte, font, rise: RISE, scale: RISE_SCALE };
   }
-  return out;
 }
 
 type Token = { space: Piece } | { word: Piece[] };
