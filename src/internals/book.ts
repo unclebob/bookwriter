@@ -1,3 +1,4 @@
+import { FileHolds } from "./holds";
 import {
   assignPrefixes,
   collectIds,
@@ -177,24 +178,105 @@ async function loadGroup(
   return { kind: "group", header, body, prefix, slug, dir, entryName, children };
 }
 
+export type HeldSave = "saved" | "conflict" | "same";
+
 export async function saveNode(fs: Fs, node: TreeNode, header: Header, body: string): Promise<void> {
-  const kept: Header = { ...header, id: node.header.id };
-  const text = serializeSection(kept, body);
+  const holds = new FileHolds();
   const path = filePath(node);
-  let current = "";
+  let current: string | null = null;
   try {
     current = await fs.readText(path);
   } catch {
-    current = "";
+    current = null;
   }
-  if (current !== text) await fs.writeText(path, text);
+  if (current !== null) holds.replaceAll(new Map([[node.header.id, { path, bytes: current }]]));
+  const result = await saveHeldNode(fs, holds, node, header, body);
+  if (result === "conflict") throw new Error(`Could not save ${path}.`);
+}
+
+export async function saveHeldNode(
+  fs: Fs,
+  holds: FileHolds,
+  node: TreeNode,
+  header: Header,
+  body: string,
+): Promise<HeldSave> {
+  const kept: Header = { ...header, id: node.header.id };
+  const next = serializeSection(kept, body);
+  const path = filePath(node);
+  let disk: string | null = null;
+  try {
+    disk = await fs.readText(path);
+  } catch {
+    disk = null;
+  }
+  const plan = holds.planSave(node.header.id, disk, next);
+  if (plan.write !== null) await fs.writeText(path, plan.write);
+  node.header = kept;
+  node.body = body;
+  if (plan.write === null && disk !== next) return "conflict";
+  if (plan.write === null) return "same";
+  return "saved";
+}
+
+export async function saveBookTitle(fs: Fs, book: Book, title: string): Promise<void> {
+  const holds = new FileHolds();
+  const path = joinPath(book.root, "book.yaml");
+  let current: string | null = null;
+  try {
+    current = await fs.readText(path);
+  } catch {
+    current = null;
+  }
+  if (current !== null) holds.replaceAll(new Map([["book.yaml", { path, bytes: current }]]));
+  const result = await saveHeldTitle(fs, holds, book, title);
+  if (result === "conflict") throw new Error(`Could not save ${path}.`);
+}
+
+export async function saveHeldTitle(fs: Fs, holds: FileHolds, book: Book, title: string): Promise<HeldSave> {
+  const next = serializeTitle(title);
+  const path = joinPath(book.root, "book.yaml");
+  const disk = await readOrNull(fs, path);
+  const plan = holds.planSave("book.yaml", disk, next);
+  if (plan.write !== null) await fs.writeText(path, plan.write);
+  book.title = title;
+  if (plan.write === null && disk !== next) return "conflict";
+  if (plan.write === null) return "same";
+  return "saved";
+}
+
+export async function overwriteHeldNode(
+  fs: Fs,
+  holds: FileHolds,
+  node: TreeNode,
+  header: Header,
+  body: string,
+): Promise<void> {
+  const kept: Header = { ...header, id: node.header.id };
+  const next = serializeSection(kept, body);
+  const keptFile = holds.keepMine(node.header.id, next);
+  const path = keptFile.path || filePath(node);
+  if (keptFile.removePath) await fs.remove(keptFile.removePath);
+  await fs.writeText(path, keptFile.bytes);
   node.header = kept;
   node.body = body;
 }
 
-export async function saveBookTitle(fs: Fs, book: Book, title: string): Promise<void> {
-  await fs.writeText(joinPath(book.root, "book.yaml"), serializeTitle(title));
+export async function overwriteHeldTitle(fs: Fs, holds: FileHolds, book: Book, title: string): Promise<void> {
+  const next = serializeTitle(title);
+  const keptFile = holds.keepMine("book.yaml", next);
+  const path = keptFile.path || joinPath(book.root, "book.yaml");
+  if (keptFile.removePath) await fs.remove(keptFile.removePath);
+  await fs.writeText(path, keptFile.bytes);
   book.title = title;
+}
+
+async function readOrNull(fs: Fs, path: string): Promise<string | null> {
+  try {
+    return await fs.readText(path);
+  } catch {
+    return null;
+  }
 }
 
 export async function createNode(
