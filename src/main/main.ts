@@ -6,6 +6,7 @@ import { findNext, findPrevious, getSearchQuery, openSearchPanel, search, search
 import { EditorSelection, EditorState, Transaction } from "@codemirror/state";
 import { EditorView, keymap, type Command } from "@codemirror/view";
 import { convertFileSrc } from "@tauri-apps/api/core";
+import { getCurrentWindow } from "@tauri-apps/api/window";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
 import { open, save } from "@tauri-apps/plugin-dialog";
 import { Menu, MenuItem, PredefinedMenuItem, Submenu } from "@tauri-apps/api/menu";
@@ -17,11 +18,15 @@ import {
   loadBook,
   manuscriptNodes,
   moveNode,
-  saveBookTitle,
-  saveNode,
+  overwriteHeldNode,
+  overwriteHeldTitle,
+  saveHeldNode,
+  saveHeldTitle,
   type Book,
   type DropZone,
 } from "../internals/book";
+import { FileHolds, hasNewRefresh, type HeldFile } from "../internals/holds";
+import { bodyPlace, bookRelative, createPlaceWriter, manuscriptPlace, readingPlace, titlePlace } from "../internals/place";
 import { COMMANDS, applyCommand, changedSpan, latestLanguage, type CommandId, type MarkupCommand } from "../ui/commands";
 import { exportBook, exportChapter, exportDocxFiles, type ChapterExport } from "../export/export";
 import { nextMatch, previousMatch, type FindHit, type FindPart } from "../ui/find";
@@ -29,17 +34,28 @@ import { chapterPdf, exportPdfWithPictures } from "../export/pdf";
 import { rasterizePicture } from "../ui/rasterize";
 import { formatAccelerator } from "../ui/keys";
 import { blockAtLine, lineOffset, offsetFraction, scrollToSpot, sourceOffset } from "../ui/locate";
-import { divisionLabel, divisions, effectiveUnit, findNode, nodeWordCount, slugify, UNITS, walk, type Division, type Header, type Status, type TreeNode, type Unit } from "../internals/model";
+import { divisionLabel, divisions, effectiveUnit, filePath, findNode, nodeWordCount, parseSection, parseTitle, slugify, UNITS, walk, type Division, type Header, type Status, type TreeNode, type Unit } from "../internals/model";
 import { joinPath, parentPath } from "../internals/path";
 import { PICTURE_EXTENSIONS, placePicture, resolvePictureSources } from "../internals/pictures";
 import { renderBook, renderGroup, renderSection } from "../ui/preview";
 import { clampPreviewWidth, previewWidthFromPointer } from "../ui/split";
-import { allowBook, pandocDocx, startupBookPath, tauriFs } from "../ui/tauriFs";
+import { allowBook, clearPlace, ensureCompanion, pandocDocx, readRefresh, setOpenBook, startupBookPath, stopCompanion, tauriFs, writePlace } from "../ui/tauriFs";
 import { dropRedo, emptyTrail, historyStep, noteVisit, redoVisit, undoVisit, type Trail } from "../ui/trail";
 
 const fs = tauriFs;
+const holds = new FileHolds();
+const places = createPlaceWriter(
+  (json) => writePlace(json),
+  () => clearPlace(),
+);
+let appliedToken: string | null = null;
+let companionWatching = false;
+let preserved: TreeNode | null = null;
 const bookTitle = document.querySelector<HTMLInputElement>("#book-title")!;
 const saveState = document.querySelector<HTMLElement>("#save-state")!;
+const conflictStatus = document.querySelector<HTMLElement>("#conflict-status")!;
+const keepMineButton = document.querySelector<HTMLButtonElement>("#keep-mine")!;
+const takeTheirsButton = document.querySelector<HTMLButtonElement>("#take-theirs")!;
 const warningsEl = document.querySelector<HTMLElement>("#warnings")!;
 const outlineEl = document.querySelector<HTMLElement>("#outline")!;
 const inspector = document.querySelector<HTMLFormElement>("#inspector")!;
@@ -171,7 +187,10 @@ const editorExtensions = [
     if (update.transactions.some((tr) => tr.annotation(Transaction.userEvent) === "select.search")) {
       scrollPreviewToCursor();
     }
+    if (update.selectionSet && !suppress) publishPlace();
     if (!update.docChanged || suppress) return;
+    const current = selected();
+    if (current) holds.markEditing(current.node.header.id);
     const motion = update.transactions.some((tr) => {
       const event = tr.annotation(Transaction.userEvent);
       return event === "undo" || event === "redo";
@@ -317,9 +336,17 @@ function hasSaveTarget(current: Selection | null): boolean {
 }
 
 async function saveCurrent(current: Selection): Promise<void> {
-  await saveNode(fs, current.node, headerFromForm(current.node), flushBody(current));
+  holds.markEditing(current.node.header.id);
+  const result = await saveHeldNode(fs, holds, current.node, headerFromForm(current.node), flushBody(current));
+  if (result === "conflict") {
+    dirty = true;
+    saveState.textContent = "Unsaved";
+    paintConflict(true);
+    return;
+  }
   dirty = false;
   saveState.textContent = "Saved";
+  paintConflict(holds.anyConflict());
   paintWordCount();
 }
 
@@ -1278,12 +1305,24 @@ function notShowingRead(group: boolean): boolean {
 }
 
 async function choose(id: string, prose: boolean): Promise<void> {
+  if (blockedByConflict(id, prose)) return;
   if (sameSelection(id, prose)) {
     showCurrent();
+    publishPlace();
     return;
   }
   await switchSelection(id, prose);
   showCurrent();
+  publishPlace();
+}
+
+function blockedByConflict(id: string, prose: boolean): boolean {
+  return openFileConflict() && !sameSelection(id, prose);
+}
+
+function openFileConflict(): boolean {
+  const id = selected()?.node.header.id ?? preserved?.header.id;
+  return id != null && holds.conflict(id);
 }
 
 function sameSelection(id: string, prose: boolean): boolean {
@@ -1401,6 +1440,14 @@ async function openCanonical(full: string): Promise<void> {
   document.title = titled(loaded.title);
   saveState.textContent = "Saved";
   await refresh(BOOK_ID, true);
+  if (!book) return;
+  holds.replaceAll(await snapshotFiles(book));
+  preserved = null;
+  await setOpenBook(book.root);
+  appliedToken = await readRefresh().catch(() => null);
+  void ensureCompanion().catch((error: unknown) => showWarnings([String(error)]));
+  watchCompanion();
+  publishPlace();
   if (pictureWarning) showWarnings([...bookWarnings(), pictureWarning]);
 }
 
@@ -1450,7 +1497,7 @@ async function showDisk(): Promise<void> {
   cancelSave();
   navigating = true;
   try {
-    await refresh(selectedId ?? BOOK_ID);
+    await applyFromDisk("revert");
   } catch (error) {
     resumeSave();
     throw error;
@@ -1463,6 +1510,234 @@ async function showDisk(): Promise<void> {
   if (dirty) resumeSave();
   else markSaved();
   if (editing()) editor.focus();
+  publishPlace();
+}
+
+async function applyFromDisk(reason: "token" | "revert"): Promise<void> {
+  if (!book) return;
+  const open = selected();
+  const openNode = open?.node ?? preserved;
+  const openId = openNode?.header.id ?? null;
+  const disk = openNode ? await readMaybe(filePath(openNode)) : null;
+  if (openId != null && reason === "revert" && !holds.conflict(openId) && holds.matchesBase(openId, disk)) {
+    holds.revertToBase(openId);
+  }
+  const keepBody = openId != null && holds.keepOpenBuffer(openId, reason, disk);
+  const mine = keepBody && openNode
+    ? { header: headerFromForm(openNode), body: shownBody(openNode) }
+    : null;
+  const titlePath = joinPath(book.root, "book.yaml");
+  const titleDisk = await readMaybe(titlePath);
+  if (reason === "revert" && !holds.conflict("book.yaml") && holds.matchesBase("book.yaml", titleDisk)) {
+    holds.revertToBase("book.yaml");
+  }
+  const keepTitle = holds.keepOpenBuffer("book.yaml", reason, titleDisk);
+  const typedTitle = bookTitle.value;
+  const previousId = selectedId;
+  const previousProse = editingProse;
+  const loaded = await loadBook(fs, book.root);
+  holds.observe(await snapshotFiles(loaded));
+  book = loaded;
+  if (keepTitle) {
+    book.title = typedTitle;
+    bookTitle.value = typedTitle;
+  } else {
+    bookTitle.value = book.title;
+    document.title = titled(book.title);
+  }
+  if (mine && openId && openNode) {
+    restoreMine(openId, openNode, mine);
+  } else {
+    preserved = null;
+    selectedId = keptId(previousId);
+    editingProse = previousProse;
+    loadRefreshedDocument(selectionChanged(false, previousId, previousProse));
+  }
+  renderOutline();
+  fillInspector();
+  drawReading();
+  drawPreview();
+  paintConflict(holds.anyConflict());
+  if (!keepBody && !dirty) markSaved();
+}
+
+function shownBody(node: TreeNode): string {
+  const current = selected();
+  if (current?.node.header.id === node.header.id && editingNode(node)) {
+    return editor.state.doc.toString();
+  }
+  return node.body;
+}
+
+function restoreMine(
+  openId: string,
+  openNode: TreeNode,
+  mine: { header: Header; body: string },
+): void {
+  const found = book ? findNode(book.nodes, openId) : null;
+  const header = { ...mine.header, id: openId };
+  if (found) {
+    found.node.header = header;
+    found.node.body = mine.body;
+    preserved = null;
+    selectedId = openId;
+    return;
+  }
+  preserved = { ...openNode, header, body: mine.body };
+  selectedId = openId;
+}
+
+async function snapshotFiles(current: Book): Promise<Map<string, HeldFile>> {
+  const files = new Map<string, HeldFile>();
+  const titlePath = joinPath(current.root, "book.yaml");
+  const title = await readMaybe(titlePath);
+  if (title !== null) files.set("book.yaml", { path: titlePath, bytes: title });
+  const nodes: TreeNode[] = [];
+  walk(current.nodes, (node) => nodes.push(node));
+  for (const node of nodes) {
+    const path = filePath(node);
+    const bytes = await readMaybe(path);
+    if (bytes !== null) files.set(node.header.id, { path, bytes });
+  }
+  return files;
+}
+
+async function readMaybe(path: string): Promise<string | null> {
+  try {
+    return await fs.readText(path);
+  } catch {
+    return null;
+  }
+}
+
+function watchCompanion(): void {
+  if (companionWatching) return;
+  companionWatching = true;
+  window.setInterval(() => {
+    void pollCompanion();
+  }, 400);
+}
+
+async function pollCompanion(): Promise<void> {
+  if (!book) return;
+  let token: string | null;
+  try {
+    token = await readRefresh();
+  } catch (error) {
+    showWarnings([String(error)]);
+    return;
+  }
+  if (!hasNewRefresh(appliedToken, token)) return;
+  navigating = true;
+  try {
+    await applyFromDisk("token");
+    appliedToken = token;
+  } catch (error) {
+    showWarnings([`The book could not be read. ${String(error)}`]);
+  } finally {
+    navigating = false;
+  }
+  publishPlace();
+}
+
+function publishPlace(): void {
+  if (!book) {
+    places.submit(null);
+    return;
+  }
+  if (document.activeElement === bookTitle) {
+    const anchor = bookTitle.selectionStart ?? 0;
+    const head = bookTitle.selectionEnd ?? anchor;
+    places.submit(titlePlace(bookTitle.value, anchor, head));
+    return;
+  }
+  if (!selectedId || selectedId === BOOK_ID) {
+    places.submit(manuscriptPlace());
+    return;
+  }
+  const current = selected();
+  if (!current) {
+    places.submit(manuscriptPlace());
+    return;
+  }
+  if (current.node.kind === "group" && !editingProse) {
+    places.submit(readingPlace(current.node.header.id));
+    return;
+  }
+  const selection = editor.state.selection.main;
+  places.submit(
+    bodyPlace(
+      bookRelative(book.root, filePath(current.node)),
+      current.node.header.id,
+      editor.state.doc.toString(),
+      selection.anchor,
+      selection.head,
+    ),
+  );
+}
+
+function paintConflict(conflict: boolean): void {
+  conflictStatus.hidden = !conflict;
+  keepMineButton.hidden = !conflict;
+  takeTheirsButton.hidden = !conflict;
+  conflictStatus.textContent = conflict ? "The companion changed this file." : "";
+}
+
+async function keepOpenFile(): Promise<void> {
+  if (!book) return;
+  if (holds.conflict("book.yaml")) await overwriteHeldTitle(fs, holds, book, bookTitle.value);
+  const current = selected();
+  const node = current?.node ?? preserved;
+  if (node && holds.conflict(node.header.id)) {
+    await overwriteHeldNode(fs, holds, node, headerFromForm(node), shownBody(node));
+    preserved = null;
+    await applyFromDisk("token");
+  }
+  dirty = false;
+  markSaved();
+  paintConflict(holds.anyConflict());
+  showCurrent();
+  publishPlace();
+}
+
+async function takeCompanionFile(): Promise<void> {
+  if (!book) return;
+  if (holds.conflict("book.yaml")) {
+    const taken = holds.takeTheirs("book.yaml");
+    if (taken.bytes != null) {
+      book.title = parseTitle(taken.bytes);
+      bookTitle.value = book.title;
+      document.title = titled(book.title);
+    }
+  }
+  const current = selected();
+  const id = current?.node.header.id ?? preserved?.header.id;
+  if (id && holds.conflict(id)) {
+    const taken = holds.takeTheirs(id);
+    preserved = null;
+    if (taken.bytes == null) {
+      selectedId = BOOK_ID;
+      editingProse = false;
+      loadDocument("", true);
+    } else {
+      const parsed = parseSection(taken.bytes);
+      const found = findNode(book.nodes, id);
+      if (found) {
+        found.node.header = parsed.header;
+        found.node.body = parsed.body;
+        selectedId = id;
+        if (editing()) loadDocument(parsed.body, false);
+      } else {
+        selectedId = BOOK_ID;
+        loadDocument("", true);
+      }
+    }
+  }
+  dirty = false;
+  markSaved();
+  paintConflict(holds.anyConflict());
+  showCurrent();
+  publishPlace();
 }
 
 function resumeSave(): void {
@@ -2995,7 +3270,13 @@ readGroup.addEventListener("click", () => {
 });
 
 for (const field of [fieldTitle, fieldSynopsis, fieldStatus, fieldRole, ...unitInputs]) {
+  field.addEventListener("input", () => {
+    const current = selected();
+    if (current) holds.markEditing(current.node.header.id);
+  });
   field.addEventListener("change", () => {
+    const current = selected();
+    if (current) holds.markEditing(current.node.header.id);
     dirty = true;
     const renumber = field === fieldRole || unitInputs.includes(field as HTMLInputElement);
     void flush().then(() => {
@@ -3013,12 +3294,35 @@ for (const field of [fieldTitle, fieldSynopsis, fieldStatus, fieldRole, ...unitI
   });
 }
 
+bookTitle.addEventListener("input", () => {
+  if (!book) return;
+  holds.markEditing("book.yaml");
+  publishPlace();
+});
+bookTitle.addEventListener("focus", () => publishPlace());
+bookTitle.addEventListener("keyup", () => publishPlace());
+bookTitle.addEventListener("click", () => publishPlace());
+bookTitle.addEventListener("select", () => publishPlace());
 bookTitle.addEventListener("change", () => {
   if (!book) return;
-  void saveBookTitle(fs, book, bookTitle.value).then(() => {
+  void saveHeldTitle(fs, holds, book, bookTitle.value).then((result) => {
+    if (result === "conflict") {
+      paintConflict(true);
+      return;
+    }
     document.title = bookTitle.value || "Bookwriter";
     renderOutline();
+    paintConflict(holds.anyConflict());
   });
+});
+keepMineButton.addEventListener("click", () => {
+  void keepOpenFile();
+});
+takeTheirsButton.addEventListener("click", () => {
+  void takeCompanionFile();
+});
+void getCurrentWindow().onCloseRequested(async () => {
+  await stopCompanion().catch(() => undefined);
 });
 
 paletteInput.addEventListener("input", () => {

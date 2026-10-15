@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import { EditorState } from "@codemirror/state";
 import { COMMANDS, applyCommand, changedSpan, latestLanguage } from "./commands";
 
 describe("markup commands", () => {
@@ -127,6 +128,21 @@ describe("markup commands", () => {
     const span = changedSpan(before, edited.text);
     expect(span).toEqual({ from: 11, to: 21, insert: "*Change me.*" });
     expect(before.slice(0, span.from) + span.insert + before.slice(span.to)).toBe(edited.text);
+  });
+
+  it("maps a caret at the start of Hello onto X when X is inserted there", () => {
+    const before = EditorState.create({ doc: "Hello", selection: { anchor: 0 } });
+    const next = before.update({ changes: changedSpan("Hello", "XHello") }).state;
+    expect(next.doc.toString()).toBe("XHello");
+    expect(next.selection.main.head).toBe(0);
+    expect(next.doc.sliceString(0, 1)).toBe("X");
+  });
+
+  it("keeps a caret on e when X is inserted before it", () => {
+    const before = EditorState.create({ doc: "Hello", selection: { anchor: 1 } });
+    const next = before.update({ changes: changedSpan("Hello", "XHello") }).state;
+    expect(next.selection.main.head).toBe(2);
+    expect(next.doc.sliceString(2, 3)).toBe("e");
   });
 
   it("finds an edit at either end, and an empty edit when the text matches", () => {

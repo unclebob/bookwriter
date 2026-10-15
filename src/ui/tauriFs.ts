@@ -26,3 +26,27 @@ export function startupBookPath(): Promise<string> {
 export function pandocDocx(markdown: string, output: string, resourceDir: string): Promise<void> {
   return invoke("pandoc_docx", { markdown, output, resourceDir });
 }
+
+export function setOpenBook(root: string): Promise<void> {
+  return invoke("set_open_book", { root });
+}
+
+export function ensureCompanion(): Promise<void> {
+  return invoke("ensure_companion");
+}
+
+export function stopCompanion(): Promise<void> {
+  return invoke("stop_companion");
+}
+
+export function readRefresh(): Promise<string | null> {
+  return invoke("read_refresh");
+}
+
+export function writePlace(json: string): Promise<void> {
+  return invoke("write_place", { json });
+}
+
+export function clearPlace(): Promise<void> {
+  return invoke("clear_place");
+}

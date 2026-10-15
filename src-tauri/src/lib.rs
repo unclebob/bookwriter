@@ -5,6 +5,13 @@ use std::path::PathBuf;
 use std::process::{Child, ChildStdin, Command, Output, Stdio};
 use tauri::Manager;
 
+mod companion;
+
+use companion::{
+    clear_place, ensure_companion, read_refresh, set_open_book, stop_companion, stop_on_exit,
+    write_place, BookShell,
+};
+
 #[derive(Serialize)]
 struct DirItem {
     name: String,
@@ -214,7 +221,9 @@ fn feed_pandoc(mut child: Child, markdown: &str) -> std::io::Result<Output> {
 }
 
 fn write_stdin(stdin: Option<&mut ChildStdin>, markdown: &str) -> std::io::Result<()> {
-    stdin.map(|pipe| pipe.write_all(markdown.as_bytes())).unwrap_or(Ok(()))
+    stdin
+        .map(|pipe| pipe.write_all(markdown.as_bytes()))
+        .unwrap_or(Ok(()))
 }
 
 fn finish_pandoc(output: Output) -> Result<(), String> {
@@ -251,6 +260,7 @@ pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .plugin(tauri_plugin_clipboard_manager::init())
+        .manage(BookShell::default())
         .invoke_handler(tauri::generate_handler![
             read_text,
             read_bytes,
@@ -263,10 +273,21 @@ pub fn run() {
             remove_path,
             allow_book,
             startup_book_path,
-            pandoc_docx
+            pandoc_docx,
+            set_open_book,
+            ensure_companion,
+            stop_companion,
+            read_refresh,
+            write_place,
+            clear_place
         ])
-        .run(tauri::generate_context!())
-        .expect("error while running Bookwriter");
+        .build(tauri::generate_context!())
+        .expect("error while running Bookwriter")
+        .run(|app, event| {
+            if let tauri::RunEvent::Exit = event {
+                stop_on_exit(&app.state::<BookShell>());
+            }
+        });
 }
 
 #[cfg(test)]
@@ -275,7 +296,10 @@ mod tests {
     use std::time::{SystemTime, UNIX_EPOCH};
 
     fn temp_dir() -> PathBuf {
-        let nanos = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let nanos = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let path = std::env::temp_dir().join(format!("bookwriter-{nanos}"));
         fs::create_dir_all(&path).unwrap();
         path
@@ -298,7 +322,9 @@ mod tests {
         assert!(names.contains(&("chapters".into(), "dir".into())));
         assert!(names.contains(&("pictures".into(), "dir".into())));
         let chapter = read_dir(dir.join("chapters").to_string_lossy().into_owned()).unwrap();
-        assert!(chapter.iter().any(|item| item.name == "one.md" && item.kind == "file"));
+        assert!(chapter
+            .iter()
+            .any(|item| item.name == "one.md" && item.kind == "file"));
     }
 
     #[test]
@@ -307,13 +333,25 @@ mod tests {
         let from = dir.join("one.md");
         fs::write(&from, "body").unwrap();
         let renamed = dir.join("nested").join("two.md");
-        rename_path(from.to_string_lossy().into_owned(), renamed.to_string_lossy().into_owned()).unwrap();
+        rename_path(
+            from.to_string_lossy().into_owned(),
+            renamed.to_string_lossy().into_owned(),
+        )
+        .unwrap();
         assert_eq!(fs::read_to_string(&renamed).unwrap(), "body");
 
         let moved = dir.join("elsewhere").join("three.md");
-        move_file(renamed.to_string_lossy().into_owned(), moved.to_string_lossy().into_owned()).unwrap();
+        move_file(
+            renamed.to_string_lossy().into_owned(),
+            moved.to_string_lossy().into_owned(),
+        )
+        .unwrap();
         assert_eq!(fs::read_to_string(&moved).unwrap(), "body");
-        assert!(move_file(dir.join("missing.md").to_string_lossy().into_owned(), dir.join("nope.md").to_string_lossy().into_owned()).is_err());
+        assert!(move_file(
+            dir.join("missing.md").to_string_lossy().into_owned(),
+            dir.join("nope.md").to_string_lossy().into_owned()
+        )
+        .is_err());
     }
 
     #[test]
@@ -332,7 +370,11 @@ mod tests {
         fs::write(&leftover, "x").unwrap();
         assert!(remove_copied_source(stuck.to_str().unwrap(), leftover.to_str().unwrap()).is_err());
         assert!(!leftover.exists());
-        assert!(copy_then_remove(dir.join("gone.md").to_str().unwrap(), dir.join("out.md").to_str().unwrap()).is_err());
+        assert!(copy_then_remove(
+            dir.join("gone.md").to_str().unwrap(),
+            dir.join("out.md").to_str().unwrap()
+        )
+        .is_err());
     }
 
     #[test]
@@ -355,7 +397,9 @@ mod tests {
     #[test]
     fn reads_a_book_path_from_arguments() {
         let dir = temp_dir();
-        let found = book_from(["--", "-x", dir.to_str().unwrap()]).unwrap().unwrap();
+        let found = book_from(["--", "-x", dir.to_str().unwrap()])
+            .unwrap()
+            .unwrap();
         assert_eq!(found, dir.canonicalize().unwrap().to_string_lossy());
         assert!(book_from(["notes.md"]).is_err());
         assert!(book_from(["--", "-h"]).unwrap().is_none());
@@ -398,8 +442,14 @@ mod tests {
 
     #[test]
     fn reports_pandoc_failure() {
-        assert_eq!(finish_pandoc(failed_pandoc("")).unwrap_err(), "Pandoc failed.");
-        assert_eq!(finish_pandoc(failed_pandoc("pandoc: boom\n")).unwrap_err(), "pandoc: boom");
+        assert_eq!(
+            finish_pandoc(failed_pandoc("")).unwrap_err(),
+            "Pandoc failed."
+        );
+        assert_eq!(
+            finish_pandoc(failed_pandoc("pandoc: boom\n")).unwrap_err(),
+            "pandoc: boom"
+        );
         let missing = std::io::Error::new(ErrorKind::NotFound, "no such file");
         assert_eq!(pandoc_io_error(missing), "Pandoc is not installed.");
         let denied = std::io::Error::new(ErrorKind::PermissionDenied, "denied");
