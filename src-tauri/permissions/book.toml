@@ -14,4 +14,10 @@ commands.allow = [
   "allow_book",
   "startup_book_path",
   "pandoc_docx",
+  "set_open_book",
+  "ensure_companion",
+  "stop_companion",
+  "read_refresh",
+  "write_place",
+  "clear_place",
 ]
