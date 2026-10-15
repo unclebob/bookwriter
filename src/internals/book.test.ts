@@ -2,7 +2,8 @@ import { access, mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { createNode, deleteNode, emptyTrash, loadBook, manuscriptNodes, moveNode, planMove, saveNode } from "./book";
+import { createNode, deleteNode, emptyTrash, loadBook, manuscriptNodes, moveNode, planMove, saveHeldNode, saveNode } from "./book";
+import { FileHolds } from "./holds";
 import { exportBook } from "../export/export";
 import { filePath, type TreeNode } from "./model";
 import { nodeFs } from "../nodeFs";
@@ -242,5 +243,27 @@ describe("the book folder", () => {
     expect(book.nodes.find((node) => node.header.id === "trash")?.children.map((child) => child.header.id)).toEqual([
       "alpha",
     ]);
+  });
+
+  it("leaves a companion section in place when the buffer is dirty", async () => {
+    const root = await mkdtemp(join(tmpdir(), "bookwriter-"));
+    const fs = nodeFs();
+    await fs.mkdir(join(root, "manuscript"));
+    await fs.writeText(join(root, "book.yaml"), "title: Trial\n");
+    let book = await loadBook(fs, root);
+    await createNode(fs, book, null, "section", "Inward");
+    book = await loadBook(fs, root);
+    const section = book.nodes[0];
+    const path = filePath(section);
+    const holds = new FileHolds();
+    holds.replaceAll(new Map([[section.header.id, { path, bytes: await fs.readText(path) }]]));
+    holds.markEditing(section.header.id);
+    const remote = await fs.readText(path);
+    const companion = remote.replace("---\n", "---\n") + "Remote.\n";
+    await fs.writeText(path, remote.endsWith("\n") ? `${remote}Remote.\n` : companion);
+    const result = await saveHeldNode(fs, holds, section, section.header, "Mine.\n");
+    expect(result).toBe("conflict");
+    expect(await fs.readText(path)).toContain("Remote.");
+    expect(await fs.readText(path)).not.toContain("Mine.");
   });
 });
