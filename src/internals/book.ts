@@ -158,7 +158,7 @@ async function loadGroup(
   const groupDir = joinPath(dir, entryName);
   const indexPath = joinPath(groupDir, "_index.md");
   let header: Header = {
-    id: slug || "section",
+    id: slug,
     title: slug.replace(/-/g, " "),
     synopsis: "",
     status: "idea",
@@ -436,6 +436,7 @@ async function rewriteDirectory(fs: Fs, dir: string, ordered: TreeNode[]): Promi
     node.prefix = prefix;
     node.entryName = name;
     node.dir = dir;
+    placeDirs(node.children, to);
   });
   await twoPhaseRename(fs, renames);
 }
@@ -464,7 +465,6 @@ export async function moveNode(fs: Fs, book: Book, movingId: string, targetId: s
   if (plans.length === 2) {
     const sourceDir = moving.node.dir;
     await rewriteDirectory(fs, sourceDir, nodesInOrder(book.nodes, plans[0].order));
-    placeDirs(book.nodes, joinPath(book.root, "manuscript"));
     const destination = plans[1];
     const destParent = destination.parentId ? findNode(book.nodes, destination.parentId) : null;
     const destDir = destParent

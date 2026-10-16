@@ -2,7 +2,22 @@ import { access, mkdtemp, readFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it } from "vitest";
-import { createNode, deleteNode, emptyTrash, loadBook, manuscriptNodes, moveNode, planMove, saveHeldNode, saveNode } from "./book";
+import {
+  createNode,
+  deleteNode,
+  emptyTrash,
+  loadBook,
+  manuscriptNodes,
+  moveNode,
+  overwriteHeldNode,
+  overwriteHeldTitle,
+  planMove,
+  saveBookTitle,
+  saveHeldNode,
+  saveHeldTitle,
+  saveNode,
+  type Fs,
+} from "./book";
 import { FileHolds } from "./holds";
 import { exportBook } from "../export/export";
 import { filePath, type TreeNode } from "./model";
@@ -392,4 +407,102 @@ describe("the book folder", () => {
     const again = await saveHeldNode(fs, holds, section, section.header, "Mine.\n");
     expect(again).toBe("same");
   });
+
+  it("saves a book title, reports same, and leaves a companion title on disk", async () => {
+    const root = await mkdtemp(join(tmpdir(), "bookwriter-"));
+    const fs = nodeFs();
+    await fs.mkdir(join(root, "manuscript"));
+    await fs.writeText(join(root, "book.yaml"), "title: Trial\n");
+    const book = await loadBook(fs, root);
+    const path = join(root, "book.yaml");
+    const holds = new FileHolds();
+    holds.replaceAll(new Map([["book.yaml", { path, bytes: await fs.readText(path) }]]));
+    holds.markEditing("book.yaml");
+
+    expect(await saveHeldTitle(fs, holds, book, "Renamed")).toBe("saved");
+    expect(book.title).toBe("Renamed");
+    expect((await loadBook(fs, root)).title).toBe("Renamed");
+
+    expect(await saveHeldTitle(fs, holds, book, "Renamed")).toBe("same");
+
+    holds.markEditing("book.yaml");
+    await fs.writeText(path, "title: Theirs\n");
+    expect(await saveHeldTitle(fs, holds, book, "Mine")).toBe("conflict");
+    expect((await loadBook(fs, root)).title).toBe("Theirs");
+  });
+
+  it("writes the book title it just read, and refuses when that file changes first", async () => {
+    const root = await mkdtemp(join(tmpdir(), "bookwriter-"));
+    const fs = nodeFs();
+    await fs.mkdir(join(root, "manuscript"));
+    await fs.writeText(join(root, "book.yaml"), "title: Trial\n");
+    const book = await loadBook(fs, root);
+    const path = join(root, "book.yaml");
+
+    await saveBookTitle(fs, book, "From Disk");
+    expect(book.title).toBe("From Disk");
+    expect((await loadBook(fs, root)).title).toBe("From Disk");
+
+    const racing = titleOnSecondRead(fs, path, "title: Theirs\n");
+    await expect(saveBookTitle(racing, book, "Too Late")).rejects.toThrow(/Could not save/);
+    expect((await loadBook(fs, root)).title).toBe("From Disk");
+  });
+
+  it("keeps the open title and the open section after a companion write", async () => {
+    const root = await mkdtemp(join(tmpdir(), "bookwriter-"));
+    const fs = nodeFs();
+    await fs.mkdir(join(root, "manuscript"));
+    await fs.writeText(join(root, "book.yaml"), "title: Trial\n");
+    let book = await loadBook(fs, root);
+    await createNode(fs, book, null, "section", "Inward");
+    book = await loadBook(fs, root);
+    const section = book.nodes[0];
+    const path = filePath(section);
+    const titlePath = join(root, "book.yaml");
+    const holds = new FileHolds();
+    holds.replaceAll(
+      new Map([
+        [section.header.id, { path, bytes: await fs.readText(path) }],
+        ["book.yaml", { path: titlePath, bytes: await fs.readText(titlePath) }],
+      ]),
+    );
+
+    holds.markEditing(section.header.id);
+    await fs.writeText(path, `${await fs.readText(path)}Remote.\n`);
+    const header = { ...section.header, title: "Kept" };
+    expect(await saveHeldNode(fs, holds, section, header, "Mine.\n")).toBe("conflict");
+    await overwriteHeldNode(fs, holds, section, header, "Mine.\n");
+    expect(section.header.title).toBe("Kept");
+    expect(section.body).toBe("Mine.\n");
+    const kept = await fs.readText(path);
+    expect(kept).toContain("title: Kept\n");
+    expect(kept).toContain("Mine.\n");
+    expect(kept).not.toContain("Remote.");
+
+    holds.markEditing("book.yaml");
+    await fs.writeText(titlePath, "title: Theirs\n");
+    expect(await saveHeldTitle(fs, holds, book, "Mine")).toBe("conflict");
+    await overwriteHeldTitle(fs, holds, book, "Mine");
+    expect(book.title).toBe("Mine");
+    expect((await loadBook(fs, root)).title).toBe("Mine");
+
+    const unheld = new FileHolds();
+    await overwriteHeldNode(fs, unheld, section, section.header, "Fallback.\n");
+    expect(await fs.readText(path)).toContain("Fallback.\n");
+    await overwriteHeldTitle(fs, unheld, book, "Fallback");
+    expect((await loadBook(fs, root)).title).toBe("Fallback");
+  });
 });
+
+function titleOnSecondRead(inner: Fs, path: string, next: string): Fs {
+  let reads = 0;
+  return {
+    ...inner,
+    readText(target) {
+      if (target !== path) return inner.readText(target);
+      reads += 1;
+      if (reads === 2) return Promise.resolve(next);
+      return inner.readText(target);
+    },
+  };
+}
