@@ -31,6 +31,11 @@ export class FileHolds {
     this.holds.set(id, { kind: "editing", path: hold.path, base: hold.bytes });
   }
 
+  ensureTracked(id: string, file: HeldFile): void {
+    if (this.holds.has(id)) return;
+    this.holds.set(id, { kind: "tracked", path: file.path, bytes: file.bytes });
+  }
+
   editing(id: string): boolean {
     const hold = this.holds.get(id);
     return hold?.kind === "editing" || hold?.kind === "conflict";

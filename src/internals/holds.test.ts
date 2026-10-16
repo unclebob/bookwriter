@@ -25,6 +25,14 @@ describe("file holds", () => {
     expect(holds.planSave("open", "Remote", "Mine")).toEqual({ write: null });
   });
 
+  it("tracks a file the window has not seen, and leaves a known file alone", () => {
+    const holds = loaded();
+    holds.ensureTracked("open", { path: "elsewhere.md", bytes: "Other" });
+    holds.ensureTracked("fresh", { path: "manuscript/030-fresh.md", bytes: "New" });
+    expect(holds.planSave("open", "Hello", "Mine")).toEqual({ write: "Mine" });
+    expect(holds.planSave("fresh", "New", "Renamed")).toEqual({ write: "Renamed" });
+  });
+
   it("writes when disk is still the base", () => {
     const holds = loaded();
     holds.markEditing("open");

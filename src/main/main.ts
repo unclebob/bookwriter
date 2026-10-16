@@ -82,6 +82,7 @@ const createDialog = document.querySelector<HTMLDialogElement>("#create-dialog")
 const contextMenu = document.querySelector<HTMLElement>("#context-menu")!;
 const createLabel = document.querySelector<HTMLElement>("#create-label")!;
 const createTitle = document.querySelector<HTMLInputElement>("#create-title")!;
+const createOk = createDialog.querySelector<HTMLButtonElement>('button[value="ok"]')!;
 
 let book: Book | null = null;
 /** Outline row for the whole manuscript. Not a node id. */
@@ -1926,17 +1927,25 @@ createDialog.addEventListener("click", (event) => {
 });
 
 function askTitle(label: string): Promise<string | null> {
+  return askNamed(label, "", "Create");
+}
+
+function askNamed(label: string, value: string, confirm: string): Promise<string | null> {
   createLabel.textContent = label;
-  createTitle.value = "";
+  createTitle.value = value;
+  createOk.textContent = confirm;
   createDialog.showModal();
   createTitle.focus();
+  createTitle.select();
   return new Promise((resolve) => {
-    createDialog.addEventListener(
-      "close",
-      () => resolve(createDialog.returnValue === "ok" ? createTitle.value.trim() : null),
-      { once: true },
-    );
+    createDialog.addEventListener("close", () => resolve(namedTitle()), { once: true });
   });
+}
+
+function namedTitle(): string | null {
+  if (createDialog.returnValue !== "ok") return null;
+  const title = createTitle.value.trim();
+  return title || null;
 }
 
 createTitle.addEventListener("keydown", (event) => {
@@ -2055,6 +2064,7 @@ function fillBookActions(): void {
 
 function bookActions(): ContextAction[] {
   return [
+    { label: "Rename", run: () => renameBook() },
     { label: "Add text", run: () => addTextAtBook() },
     { label: "Add folder", run: () => addFolderAtBook() },
   ];
@@ -2077,7 +2087,12 @@ function contextActions(node: TreeNode, inTrash: boolean): ContextAction[] {
 
 function rowActions(node: TreeNode, inTrash: boolean): ContextAction[] {
   const actions = node.kind === "group" ? groupActions(node) : sectionActions(node);
-  return withDelete(withChapterPdf(actions, node, inTrash), node, inTrash);
+  return withDelete(withChapterPdf(withRename(actions, node), node, inTrash), node, inTrash);
+}
+
+function withRename(actions: ContextAction[], node: TreeNode): ContextAction[] {
+  if (isTrash(node)) return actions;
+  return [{ label: "Rename", run: () => renameNode(node.header.id) }, ...actions];
 }
 
 function withChapterPdf(actions: ContextAction[], node: TreeNode, inTrash: boolean): ContextAction[] {
@@ -2158,6 +2173,69 @@ function appendCommandItem(command: MarkupCommand, mac: boolean): void {
 
 function commandShortcut(accelerator: string | undefined, mac: boolean): string | undefined {
   return accelerator ? formatAccelerator(accelerator, mac) : undefined;
+}
+
+async function renameBook(): Promise<void> {
+  if (!book) return;
+  const title = await askNamed("Rename", book.title, "Rename");
+  if (!title || title === book.title) return;
+  await writeBookTitle(title);
+}
+
+async function writeBookTitle(title: string): Promise<void> {
+  if (!book) return;
+  bookTitle.value = title;
+  holds.markEditing("book.yaml");
+  const result = await saveHeldTitle(fs, holds, book, title);
+  if (result === "conflict") {
+    paintConflict(true);
+    return;
+  }
+  document.title = title || "Bookwriter";
+  renderOutline();
+  paintConflict(holds.anyConflict());
+  publishPlace();
+}
+
+async function renameNode(id: string): Promise<void> {
+  const found = rowNode(id);
+  if (!found || isTrash(found.node)) return;
+  const title = await askNamed("Rename", found.node.header.title, "Rename");
+  if (!title || title === found.node.header.title) return;
+  if (selected()?.node.header.id === id) await renameOpen(title);
+  else await renameClosed(found.node, title);
+}
+
+async function renameOpen(title: string): Promise<void> {
+  const current = selected();
+  if (!current) return;
+  fieldTitle.value = title;
+  holds.markEditing(current.node.header.id);
+  dirty = true;
+  await flush();
+  showCurrent();
+}
+
+async function renameClosed(node: TreeNode, title: string): Promise<void> {
+  const previous = { header: { ...node.header }, body: node.body };
+  const path = filePath(node);
+  const disk = await readMaybe(path);
+  if (disk !== null) holds.ensureTracked(node.header.id, { path, bytes: disk });
+  const source = closedSource(node, disk);
+  const result = await saveHeldNode(fs, holds, node, { ...source.header, title }, source.body);
+  if (result === "conflict") {
+    node.header = previous.header;
+    node.body = previous.body;
+    paintConflict(true);
+    return;
+  }
+  showCurrent();
+}
+
+function closedSource(node: TreeNode, disk: string | null): { header: Header; body: string } {
+  if (disk === null) return { header: node.header, body: node.body };
+  const parsed = parseSection(disk);
+  return { header: { ...parsed.header, id: node.header.id }, body: parsed.body };
 }
 
 async function addTextAtBook(): Promise<void> {
