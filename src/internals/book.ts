@@ -101,12 +101,11 @@ async function loadChildren(fs: Fs, dir: string, entries: DirEntry[], warnings: 
   const nodes: TreeNode[] = [];
   const prefixes = new Set<string>();
   const sorted = entries
-    .filter((entry) => !entry.name.startsWith(".") && !entry.name.startsWith("__bw_tmp_"))
     .map((entry) => ({ entry, match: ENTRY.exec(entry.kind === "file" ? entry.name.replace(/\.md$/, "") : entry.name) }))
     .filter((item) => item.match && (item.entry.kind === "dir" || item.entry.name.endsWith(".md")))
     .sort((a, b) => {
-      const an = Number.parseInt(a.match![1], 10);
-      const bn = Number.parseInt(b.match![1], 10);
+      const an = Number(a.match![1]);
+      const bn = Number(b.match![1]);
       if (an !== bn) return an - bn;
       return a.entry.name.localeCompare(b.entry.name);
     });

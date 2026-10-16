@@ -88,11 +88,16 @@ export function assignPrefixes(count: number): string[] {
 }
 
 export function nextPrefix(existing: string[]): string {
-  const nums = existing.map((prefix) => Number.parseInt(prefix, 10)).filter((n) => !Number.isNaN(n));
+  const nums = existing.map(wholeNumber).filter((n): n is number => n !== null);
   const max = nums.length ? Math.max(...nums) : 0;
   const n = max + 10;
   const width = Math.max(3, String(n).length);
   return String(n).padStart(width, "0");
+}
+
+function wholeNumber(text: string): number | null {
+  if (!/^\d+$/.test(text)) return null;
+  return Number(text);
 }
 
 export function effectiveFront(role: Role, ancestors: { role: Role }[]): boolean {

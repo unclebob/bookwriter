@@ -105,6 +105,10 @@ describe("manuscript order", () => {
     const nodes = manuscriptNodes(book.nodes);
     expect(nodes.map((node) => node.header.id)).toEqual(["c", "m", "b", "a"]);
     expect(nodes.map((node) => node.prefix)).toEqual(["010", "010", "20", "100"]);
+    await fs.writeText(join(manuscript, ".secret.md"), "hidden");
+    await fs.mkdir(join(manuscript, "__bw_tmp_half"));
+    const again = await loadBook(fs, root);
+    expect(manuscriptNodes(again.nodes).map((node) => node.header.id)).toEqual(["c", "m", "b", "a"]);
     expect(book.warnings.some((warning) => warning.includes("Duplicate prefix 010"))).toBe(true);
   });
 });
@@ -129,6 +133,7 @@ describe("the book folder", () => {
     expect(group.header.unit).toBe("section");
     expect(group.children[0].header.unit).toBe("text");
     expect(group.children.map((child) => child.header.id)).toEqual(["inward", "boundaries"]);
+    expect(group.children.map((child) => child.entryName)).toEqual(["010-inward.md", "020-boundaries.md"]);
 
     await moveNode(fs, book, edge, inward, "before");
     book = await loadBook(fs, root);
@@ -291,6 +296,32 @@ describe("the book folder", () => {
     ]);
   });
 
+  it("leaves two trashed texts in order when the first is deleted again", async () => {
+    const root = await mkdtemp(join(tmpdir(), "bookwriter-"));
+    const fs = nodeFs();
+    await fs.mkdir(join(root, "manuscript"));
+    await fs.writeText(join(root, "book.yaml"), "title: Trial\n");
+
+    let book = await loadBook(fs, root);
+    const chapter = await createNode(fs, book, null, "group", "The Rule");
+    book = await loadBook(fs, root);
+    const alpha = await createNode(fs, book, chapter, "section", "Alpha");
+    const beta = await createNode(fs, book, chapter, "section", "Beta");
+    book = await loadBook(fs, root);
+
+    await deleteNode(fs, book, alpha);
+    book = await loadBook(fs, root);
+    await deleteNode(fs, book, beta);
+    book = await loadBook(fs, root);
+    await deleteNode(fs, book, alpha);
+    book = await loadBook(fs, root);
+
+    expect(book.nodes.find((node) => node.header.id === "trash")?.children.map((child) => child.header.id)).toEqual([
+      "alpha",
+      "beta",
+    ]);
+  });
+
   it("leaves a companion section in place when the buffer is dirty", async () => {
     const root = await mkdtemp(join(tmpdir(), "bookwriter-"));
     const fs = nodeFs();
@@ -311,5 +342,26 @@ describe("the book folder", () => {
     expect(result).toBe("conflict");
     expect(await fs.readText(path)).toContain("Remote.");
     expect(await fs.readText(path)).not.toContain("Mine.");
+  });
+
+  it("reports a write, and a save whose bytes are already on disk", async () => {
+    const root = await mkdtemp(join(tmpdir(), "bookwriter-"));
+    const fs = nodeFs();
+    await fs.mkdir(join(root, "manuscript"));
+    await fs.writeText(join(root, "book.yaml"), "title: Trial\n");
+    let book = await loadBook(fs, root);
+    await createNode(fs, book, null, "section", "Inward");
+    book = await loadBook(fs, root);
+    const section = book.nodes[0];
+    const path = filePath(section);
+    const holds = new FileHolds();
+    holds.replaceAll(new Map([[section.header.id, { path, bytes: await fs.readText(path) }]]));
+
+    const wrote = await saveHeldNode(fs, holds, section, section.header, "Mine.\n");
+    expect(wrote).toBe("saved");
+    expect(await fs.readText(path)).toContain("Mine.\n");
+
+    const again = await saveHeldNode(fs, holds, section, section.header, "Mine.\n");
+    expect(again).toBe("same");
   });
 });

@@ -154,6 +154,7 @@ describe("identity and order", () => {
     expect(assignPrefixes(100)[99]).toBe("1000");
     expect(nextPrefix(["010", "020"])).toBe("030");
     expect(nextPrefix([])).toBe("010");
+    expect(nextPrefix(["010-"])).toBe("010");
     const section = treeNode("section", "inward");
     section.dir = "manuscript/010-rule";
     section.entryName = "020-inward.md";
