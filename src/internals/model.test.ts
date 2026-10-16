@@ -15,6 +15,7 @@ import {
   startsNewPage,
   stepFence,
   uniqueId,
+  nodeWordCount,
   wordCount,
   type TreeNode,
 } from "./model";
@@ -92,10 +93,19 @@ describe("section files", () => {
     expect(quoted.warnings.some((warning) => warning.includes("Role"))).toBe(true);
     expect(quoted.warnings.some((warning) => warning.includes("Ignored"))).toBe(true);
     const bare = parseSection("No header\n");
-    expect(bare.header.title).toBe("Untitled");
+    expect(bare.header).toMatchObject({
+      id: "section",
+      title: "Untitled",
+      synopsis: "",
+      status: "idea",
+      role: "body",
+    });
     expect(bare.body).toBe("No header\n");
     expect(bare.warnings.some((warning) => warning.includes("Missing header"))).toBe(true);
     const thin = parseSection("---\ntitle: T\n---\n");
+    expect(thin.header.id).toBe("section");
+    expect(thin.header.title).toBe("T");
+    expect(thin.header.synopsis).toBe("");
     expect(thin.warnings.some((warning) => warning.includes("missing id"))).toBe(true);
   });
 
@@ -223,6 +233,12 @@ describe("word count", () => {
   it("counts whitespace-separated words in the body", () => {
     expect(wordCount("")).toBe(0);
     expect(wordCount("  A dependency points inward.[^1]\n")).toBe(4);
+    const child = treeNode("section", "child");
+    child.body = "one";
+    const parent = treeNode("group", "parent", "body", [child]);
+    parent.body = "two three";
+    expect(nodeWordCount(child)).toBe(1);
+    expect(nodeWordCount(parent)).toBe(3);
   });
 });
 

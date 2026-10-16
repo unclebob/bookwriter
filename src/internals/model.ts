@@ -48,10 +48,9 @@ export function wordCount(body: string): number {
 }
 
 export function nodeWordCount(node: TreeNode): number {
-  return (
-    wordCount(node.body) +
-    node.children.reduce((sum, child) => sum + nodeWordCount(child), 0)
-  );
+  const own = wordCount(node.body);
+  const nested = node.children.reduce((sum, child) => sum + nodeWordCount(child), 0);
+  return own + nested;
 }
 
 export function slugify(title: string): string {
@@ -215,13 +214,12 @@ function escapedChar(char: string | undefined): string {
 }
 
 function defaultHeader(partial: Partial<Header>): Header {
-  return {
-    id: partial.id || "section",
-    title: partial.title ?? "",
-    synopsis: partial.synopsis ?? "",
-    status: partial.status ?? "idea",
-    role: partial.role ?? "body",
-  };
+  const id = partial.id || "section";
+  const title = partial.title || "";
+  const synopsis = partial.synopsis || "";
+  const status = partial.status || "idea";
+  const role = partial.role || "body";
+  return { id, title, synopsis, status, role };
 }
 
 export function serializeSection(header: Header, body: string): string {
@@ -294,15 +292,15 @@ function headerFromFields(fields: Map<string, string>, warnings: string[]): Head
   warnMissingKeys(fields, warnings);
   const unit = readUnit(fields.has("unit") ? fields.get("unit") : undefined, warnings);
   const pageBreak = readBreak(fields.has("break") ? fields.get("break") : undefined, warnings);
-  return {
-    id: fields.get("id") || "section",
-    title: fields.get("title") ?? "",
-    synopsis: fields.get("synopsis") ?? "",
-    status: readStatus(fields.get("status"), warnings),
-    role: readRole(fields.get("role"), warnings),
-    ...(unit === undefined ? {} : { unit }),
-    ...(pageBreak === undefined ? {} : { break: pageBreak }),
-  };
+  const id = fields.get("id") || "section";
+  const title = fields.get("title") || "";
+  const synopsis = fields.get("synopsis") || "";
+  const status = readStatus(fields.get("status"), warnings);
+  const role = readRole(fields.get("role"), warnings);
+  const header: Header = { id, title, synopsis, status, role };
+  if (unit !== undefined) header.unit = unit;
+  if (pageBreak !== undefined) header.break = pageBreak;
+  return header;
 }
 
 function sectionFromHeader(block: string, body: string, warnings: string[]): ParsedSection {
