@@ -64,7 +64,6 @@ fn read_dir(path: String) -> Result<Vec<DirItem>, String> {
 
 #[tauri::command]
 fn rename_path(from: String, to: String) -> Result<(), String> {
-    ensure_parent(&to)?;
     fs::rename(&from, &to).map_err(|error| error.to_string())
 }
 
@@ -333,6 +332,12 @@ mod tests {
         let from = dir.join("one.md");
         fs::write(&from, "body").unwrap();
         let renamed = dir.join("nested").join("two.md");
+        assert!(rename_path(
+            from.to_string_lossy().into_owned(),
+            renamed.to_string_lossy().into_owned(),
+        )
+        .is_err());
+        fs::create_dir(dir.join("nested")).unwrap();
         rename_path(
             from.to_string_lossy().into_owned(),
             renamed.to_string_lossy().into_owned(),

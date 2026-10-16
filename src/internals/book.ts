@@ -448,6 +448,13 @@ function nodesInOrder(roots: TreeNode[], ids: string[]): TreeNode[] {
   });
 }
 
+function placeDirs(nodes: TreeNode[], dir: string): void {
+  for (const node of nodes) {
+    node.dir = dir;
+    placeDirs(node.children, joinPath(dir, node.entryName));
+  }
+}
+
 export async function moveNode(fs: Fs, book: Book, movingId: string, targetId: string, zone: DropZone): Promise<void> {
   const plans = planMove(book.nodes, movingId, targetId, zone);
   if (!plans.length) return;
@@ -457,6 +464,7 @@ export async function moveNode(fs: Fs, book: Book, movingId: string, targetId: s
   if (plans.length === 2) {
     const sourceDir = moving.node.dir;
     await rewriteDirectory(fs, sourceDir, nodesInOrder(book.nodes, plans[0].order));
+    placeDirs(book.nodes, joinPath(book.root, "manuscript"));
     const destination = plans[1];
     const destParent = destination.parentId ? findNode(book.nodes, destination.parentId) : null;
     const destDir = destParent

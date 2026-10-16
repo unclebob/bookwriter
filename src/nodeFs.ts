@@ -22,7 +22,6 @@ export function nodeFs(): Fs {
       }));
     },
     async rename(from, to) {
-      await mkdir(dirname(to), { recursive: true });
       await rename(from, to);
     },
     async moveFile(from, to) {

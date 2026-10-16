@@ -202,6 +202,34 @@ describe("the book folder", () => {
     expect(roots[0].children[0].children.map((child) => child.header.id)).toEqual(["inside"]);
   });
 
+  it("moves a folder into a group that sits inside a later sibling", async () => {
+    const root = await mkdtemp(join(tmpdir(), "bookwriter-"));
+    const fs = nodeFs();
+    await fs.mkdir(join(root, "manuscript"));
+    await fs.writeText(join(root, "book.yaml"), "title: Trial\n");
+
+    let book = await loadBook(fs, root);
+    const first = await createNode(fs, book, null, "group", "A");
+    book = await loadBook(fs, root);
+    const second = await createNode(fs, book, null, "group", "B");
+    book = await loadBook(fs, root);
+    const nested = await createNode(fs, book, second, "group", "C");
+    book = await loadBook(fs, root);
+    await createNode(fs, book, first, "section", "Inside");
+    book = await loadBook(fs, root);
+
+    await moveNode(fs, book, first, nested, "inside");
+    book = await loadBook(fs, root);
+
+    const roots = book.nodes.filter((node) => node.header.id !== "trash");
+    expect(roots.map((node) => node.header.id)).toEqual(["b"]);
+    expect(roots[0].children.map((child) => child.header.id)).toEqual(["c"]);
+    expect(roots[0].children[0].children.map((child) => child.header.id)).toEqual(["a"]);
+    expect(roots[0].children[0].children[0].children.map((child) => child.header.id)).toEqual(["inside"]);
+    const names = (await fs.readDir(join(root, "manuscript"))).map((entry) => entry.name);
+    expect(names.filter((name) => name.endsWith("-b"))).toEqual(["010-b"]);
+  });
+
   it("moves a nested folder out to the front of the book", async () => {
     const root = await mkdtemp(join(tmpdir(), "bookwriter-"));
     const fs = nodeFs();
