@@ -76,7 +76,6 @@ export function uniqueId(title: string, used: Set<string>): string {
  * Past 990 the width grows so the last prefix still fits, and the step stays 10.
  */
 export function assignPrefixes(count: number): string[] {
-  if (count <= 0) return [];
   const step = 10;
   let width = 3;
   while (count * step >= 10 ** width) width += 1;
@@ -151,14 +150,12 @@ export function divisions(roots: TreeNode[]): Map<string, Division> {
         node.header.role,
         ancestors.map((ancestor) => ancestor.header),
       );
-      if (!front && (unit === "part" || unit === "chapter")) {
-        if (unit === "part") {
-          part += 1;
-          found.set(node.header.id, { unit, number: part });
-        } else {
-          chapter += 1;
-          found.set(node.header.id, { unit, number: chapter });
-        }
+      if (!front && unit === "part") {
+        part += 1;
+        found.set(node.header.id, { unit, number: part });
+      } else if (!front && unit === "chapter") {
+        chapter += 1;
+        found.set(node.header.id, { unit, number: chapter });
       }
       visit(node.children, [...ancestors, node]);
     }
@@ -212,8 +209,9 @@ function unquoteDouble(value: string): string {
 }
 
 function escapedChar(char: string | undefined): string {
-  const escaped = char ?? "";
-  return escaped === "n" ? "\n" : escaped;
+  if (char === "n") return "\n";
+  if (char === undefined) return "";
+  return char;
 }
 
 function defaultHeader(partial: Partial<Header>): Header {
@@ -343,8 +341,9 @@ export function fenceMark(line: string): { char: string; len: number; info: stri
   if (!matched) return null;
   const token = matched[2];
   const info = matched[3];
-  if (token.startsWith("`") && info.includes("`")) return null;
-  return { char: token[0], len: token.length, info };
+  const backtick = token.startsWith("`");
+  if (backtick && info.includes("`")) return null;
+  return { char: backtick ? "`" : "~", len: token.length, info };
 }
 
 export function closesFence(open: Fence, mark: { char: string; len: number; info: string }): boolean {
@@ -374,19 +373,24 @@ function fenceAfterClose(fence: Fence, mark: { char: string; len: number; info: 
 export function codeSpanRanges(line: string): Array<[number, number]> {
   const ranges: Array<[number, number]> = [];
   let index = 0;
-  while (index < line.length) {
-    if (line[index] !== "`") {
+  while (index !== line.length) {
+    const ticks = backtickRun(line, index);
+    if (ticks === 0) {
       index += 1;
       continue;
     }
-    let ticks = 0;
-    while (line[index + ticks] === "`") ticks += 1;
     const closer = line.indexOf("`".repeat(ticks), index + ticks);
-    if (closer < 0) break;
+    if (closer === -1) break;
     ranges.push([index, closer + ticks]);
     index = closer + ticks;
   }
   return ranges;
+}
+
+function backtickRun(line: string, index: number): number {
+  let ticks = 0;
+  while (line[index + ticks] === "`") ticks += 1;
+  return ticks;
 }
 
 export function insideSpan(offset: number, ranges: Array<[number, number]>): boolean {

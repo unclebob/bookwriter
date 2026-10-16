@@ -75,6 +75,7 @@ describe("section files", () => {
 
   it("reads quoted scalars, a bad role, and a file with no header", () => {
     expect(parseScalar('"say \\"hi\\"\\n"')).toBe('say "hi"\n');
+    expect(parseScalar('"a\\')).toBe("a");
     expect(parseScalar("'it''s'")).toBe("it's");
     expect(parseScalar('"unterminated')).toBe("unterminated");
     expect(parseScalar("hello'")).toBe("hello'");
@@ -243,6 +244,8 @@ describe("markup edges", () => {
   it("finds closed code spans, including the opening backtick and not the end", () => {
     expect(codeSpanRanges("``a``")).toEqual([[0, 5]]);
     expect(codeSpanRanges("`a` `b`")).toEqual([[0, 3], [4, 7]]);
+    expect(codeSpanRanges("a`b`")).toEqual([[1, 4]]);
+    expect(codeSpanRanges("`a")).toEqual([]);
     expect(insideSpan(0, [[0, 3]])).toBe(true);
     expect(insideSpan(2, [[0, 3]])).toBe(true);
     expect(insideSpan(3, [[0, 3]])).toBe(false);
