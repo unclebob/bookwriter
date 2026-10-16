@@ -456,18 +456,18 @@ export async function moveNode(fs: Fs, book: Book, movingId: string, targetId: s
   if (!moving) return;
 
   if (plans.length === 2) {
+    const sourceDir = moving.node.dir;
+    await rewriteDirectory(fs, sourceDir, nodesInOrder(book.nodes, plans[0].order));
     const destination = plans[1];
     const destParent = destination.parentId ? findNode(book.nodes, destination.parentId) : null;
     const destDir = destParent
       ? joinPath(destParent.node.dir, destParent.node.entryName)
       : joinPath(book.root, "manuscript");
-    const tempName = `__bw_tmp_${moving.node.header.id}${moving.node.kind === "section" ? ".md" : ""}`;
-    await fs.rename(joinPath(moving.node.dir, moving.node.entryName), joinPath(destDir, tempName));
-    const sourceDir = moving.node.dir;
+    const tempName = `__bw_tmp_${moving.node.header.id}`;
+    await fs.rename(joinPath(sourceDir, moving.node.entryName), joinPath(destDir, tempName));
     moving.node.dir = destDir;
     moving.node.entryName = tempName;
-    await rewriteDirectory(fs, sourceDir, nodesInOrder(book.nodes, plans[0].order));
-    await rewriteDirectory(fs, destDir, nodesInOrder(book.nodes, plans[1].order));
+    await rewriteDirectory(fs, destDir, nodesInOrder(book.nodes, destination.order));
     return;
   }
   const dir = moving.node.dir;

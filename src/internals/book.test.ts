@@ -174,6 +174,52 @@ describe("the book folder", () => {
     expect(book.nodes[0].children.map((child) => child.header.id)).toEqual(["opening", "inward", "after-inward"]);
   });
 
+  it("moves a folder into a later folder and keeps what is inside", async () => {
+    const root = await mkdtemp(join(tmpdir(), "bookwriter-"));
+    const fs = nodeFs();
+    await fs.mkdir(join(root, "manuscript"));
+    await fs.writeText(join(root, "book.yaml"), "title: Trial\n");
+
+    let book = await loadBook(fs, root);
+    const earlier = await createNode(fs, book, null, "group", "Earlier");
+    book = await loadBook(fs, root);
+    const later = await createNode(fs, book, null, "group", "Later");
+    book = await loadBook(fs, root);
+    await createNode(fs, book, earlier, "section", "Inside");
+    book = await loadBook(fs, root);
+
+    await moveNode(fs, book, earlier, later, "inside");
+    book = await loadBook(fs, root);
+
+    const roots = book.nodes.filter((node) => node.header.id !== "trash");
+    expect(roots.map((node) => node.header.id)).toEqual(["later"]);
+    expect(roots[0].children.map((child) => child.header.id)).toEqual(["earlier"]);
+    expect(roots[0].children[0].children.map((child) => child.header.id)).toEqual(["inside"]);
+  });
+
+  it("moves a nested folder out to the front of the book", async () => {
+    const root = await mkdtemp(join(tmpdir(), "bookwriter-"));
+    const fs = nodeFs();
+    await fs.mkdir(join(root, "manuscript"));
+    await fs.writeText(join(root, "book.yaml"), "title: Trial\n");
+
+    let book = await loadBook(fs, root);
+    const parent = await createNode(fs, book, null, "group", "Parent");
+    book = await loadBook(fs, root);
+    const nested = await createNode(fs, book, parent, "group", "Nested");
+    book = await loadBook(fs, root);
+    await createNode(fs, book, nested, "section", "Inside");
+    book = await loadBook(fs, root);
+
+    await moveNode(fs, book, nested, parent, "before");
+    book = await loadBook(fs, root);
+
+    const roots = book.nodes.filter((node) => node.header.id !== "trash");
+    expect(roots.map((node) => node.header.id)).toEqual(["nested", "parent"]);
+    expect(roots[0].children.map((child) => child.header.id)).toEqual(["inside"]);
+    expect(roots[1].children).toEqual([]);
+  });
+
   it("empties the trash and leaves the rest of the manuscript", async () => {
     const root = await mkdtemp(join(tmpdir(), "bookwriter-"));
     const fs = nodeFs();
