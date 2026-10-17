@@ -114,15 +114,68 @@ md.renderer.renderToken = (tokens, idx, options) => {
   return renderToken(tokens, idx, options);
 };
 
+export type TextRun = { src: number; text: string; block: boolean };
+
+type RenderEnv = { runs?: TextRun[] };
+
+const renderText = md.renderer.rules.text;
+if (renderText) {
+  md.renderer.rules.text = (tokens, idx, options, env, self) => {
+    const html = renderText(tokens, idx, options, env, self);
+    return stampText(html, env as RenderEnv, tokens[idx].content);
+  };
+}
+
+const renderCode = md.renderer.rules.code_inline;
+if (renderCode) {
+  md.renderer.rules.code_inline = (tokens, idx, options, env, self) => {
+    const html = renderCode(tokens, idx, options, env, self);
+    return stampCode(html, env as RenderEnv, tokens[idx].content);
+  };
+}
+
+function stampText(html: string, env: RenderEnv, content: string): string {
+  if (content.length === 0) return html;
+  const run = takeRun(env, content);
+  if (!run) return html;
+  return `<span data-src="${run.src}">${html}</span>`;
+}
+
+function stampCode(html: string, env: RenderEnv, content: string): string {
+  if (content.length === 0) return html;
+  const run = takeRun(env, content);
+  if (!run) return html;
+  return html.replace(/<code(?=[\s>])/, `<code data-src="${run.src}"`);
+}
+
+function takeRun(env: RenderEnv, content: string): TextRun | null {
+  const runs = env.runs ?? [];
+  const run = runs[0];
+  if (!matchedRun(run, content)) {
+    env.runs = [];
+    return null;
+  }
+  runs.shift();
+  return run;
+}
+
+function matchedRun(run: TextRun | undefined, content: string): run is TextRun {
+  return run != null && run.text === content;
+}
+
 function stampBlock(name: string): void {
   const rule = md.renderer.rules[name];
   if (!rule) return;
   md.renderer.rules[name] = (tokens, idx, options, env, self) => {
     const html = rule(tokens, idx, options, env, self);
-    const map = tokens[idx].map;
-    if (!map) return html;
-    return html.replace(/^(\s*)<([A-Za-z0-9-]+)/, `$1<$2 data-line="${map[0]}" data-end="${map[1]}"`);
+    const sourced = stampCode(html, env as RenderEnv, tokens[idx].content);
+    return stampLines(sourced, tokens[idx].map);
   };
+}
+
+function stampLines(html: string, map: [number, number] | null): string {
+  if (!map) return html;
+  return html.replace(/^(\s*)<([A-Za-z0-9-]+)/, `$1<$2 data-line="${map[0]}" data-end="${map[1]}"`);
 }
 stampBlock("fence");
 stampBlock("code_block");
@@ -205,6 +258,59 @@ function missingNotes(body: string): string[] {
   return referenced.filter((label) => !defined.has(label));
 }
 
+type MdToken = { type: string; content: string; children?: MdToken[] | null };
+
+type Scan = { source: string; pos: number; runs: TextRun[]; failed: boolean };
+
+/** Visible slices of `source`, in reading order. `src` is an offset into `source`. */
+export function textRuns(source: string): TextRun[] {
+  const scan: Scan = { source, pos: 0, runs: [], failed: false };
+  walkTokens(md.parse(source, { docId: "runs" }) as MdToken[], scan);
+  return scan.runs;
+}
+
+function walkTokens(tokens: MdToken[], scan: Scan): void {
+  for (const token of tokens) {
+    if (scan.failed) return;
+    collectToken(token, scan);
+  }
+}
+
+function collectToken(token: MdToken, scan: Scan): void {
+  if (token.type === "image") return;
+  if (isRun(token)) recordRun(token, scan);
+  else walkChildren(token, scan);
+}
+
+function isRun(token: MdToken): boolean {
+  return token.type === "text" || token.type === "code_inline" || token.type === "fence" || token.type === "code_block";
+}
+
+function walkChildren(token: MdToken, scan: Scan): void {
+  if (token.children) walkTokens(token.children, scan);
+}
+
+function recordRun(token: MdToken, scan: Scan): void {
+  if (token.content.length === 0) return;
+  const at = locateContent(scan.source, token.content, scan.pos);
+  if (at < 0) {
+    scan.failed = true;
+    return;
+  }
+  scan.runs.push({ src: at, text: token.content, block: isBlock(token) });
+  if (at >= scan.pos) scan.pos = at + token.content.length;
+}
+
+function isBlock(token: MdToken): boolean {
+  return token.type === "fence" || token.type === "code_block";
+}
+
+function locateContent(source: string, content: string, pos: number): number {
+  const forward = source.indexOf(content, pos);
+  if (forward >= 0) return forward;
+  return source.lastIndexOf(content, pos);
+}
+
 export function renderSection(node: TreeNode, ancestors: TreeNode[], division?: Division): Rendered {
   const front = effectiveFront(
     node.header.role,
@@ -223,7 +329,7 @@ export function renderSection(node: TreeNode, ancestors: TreeNode[], division?: 
   const missing = missingNotes(node.body);
   for (const label of missing) warnings.push(`Footnote [^${label}] has no definition.`);
 
-  let bodyHtml = md.render(expanded.text, { docId: node.header.id });
+  let bodyHtml = md.render(expanded.text, { docId: node.header.id, runs: textRuns(node.body) });
   if (missing.length) {
     const items = missing
       .map((label) => `<li class="missing-fn">Missing note [^${escapeHtml(label)}].</li>`)

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { TreeNode } from "../internals/model";
-import { renderBook, renderGroup, renderSection } from "./preview";
+import { renderBook, renderGroup, renderSection, textRuns } from "./preview";
 
 function section(body: string, role: TreeNode["header"]["role"] = "body"): TreeNode {
   return {
@@ -14,6 +14,65 @@ function section(body: string, role: TreeNode["header"]["role"] = "body"): TreeN
     children: [],
   };
 }
+
+describe("source runs", () => {
+  it("points each visible run at the markdown characters it shows", () => {
+    expect(textRuns("Hello **bold** world.\n")).toEqual([
+      { src: 0, text: "Hello ", block: false },
+      { src: 8, text: "bold", block: false },
+      { src: 14, text: " world.", block: false },
+    ]);
+    expect(textRuns("# Title\n\nBody.\n")).toEqual([
+      { src: 2, text: "Title", block: false },
+      { src: 9, text: "Body.", block: false },
+    ]);
+    const note = "See ^[the bridge].\n";
+    expect(textRuns(note)).toContainEqual({ src: note.indexOf("the bridge"), text: "the bridge", block: false });
+    expect(textRuns("See the ![Bridge](images/bridge.jpg){width=100%} today.\n").map((run) => run.text)).toEqual([
+      "See the ",
+      " today.",
+    ]);
+    expect(textRuns("Hello\n\n```\ncode\n```\n")).toContainEqual({ src: 11, text: "code\n", block: true });
+  });
+
+  it("stamps the rendered text with the markdown offset it came from", () => {
+    const rendered = renderSection(section("Hello **bold**.\n"), []);
+    expect(rendered.html).toContain('<span data-src="8">bold</span>');
+    expect(rendered.html).not.toContain('data-src="0">Inward');
+
+    const picture = renderSection(section("See the ![Bridge](images/bridge.jpg){width=100%} today.\n"), []);
+    expect(picture.html).toContain('alt="Bridge"');
+    expect(picture.html).toContain('<span data-src="48"> today.</span>');
+    expect(picture.html).not.toContain(">Bridge</span>");
+
+    const code = renderSection(section("Hello\n\n```\ncode\n```\n"), []);
+    expect(code.html).toContain('<code data-src="11"');
+  });
+
+  it("does not stamp text whose characters are not in the source", () => {
+    expect(textRuns("Tom &amp; Jerry\n")).toEqual([]);
+    expect(textRuns("Tom &amp; Jerry\n\nNext\n")).toEqual([]);
+    const rendered = renderSection(section("Tom &amp; Jerry\n"), []);
+    expect(rendered.html).toContain("Tom &amp; Jerry");
+    expect(rendered.html).not.toContain("data-src");
+  });
+
+  it("keeps each copy of the same characters at its own offset", () => {
+    expect(textRuns("Hi\n\nHi\n")).toEqual([
+      { src: 0, text: "Hi", block: false },
+      { src: 4, text: "Hi", block: false },
+    ]);
+    expect(textRuns("a`a`\n")).toEqual([
+      { src: 0, text: "a", block: false },
+      { src: 2, text: "a", block: false },
+    ]);
+  });
+
+  it("stamps a single character", () => {
+    expect(renderSection(section("A\n"), []).html).toContain('<span data-src="0">A</span>');
+    expect(renderSection(section("See `x`.\n"), []).html).toContain('<code data-src="5"');
+  });
+});
 
 describe("preview", () => {
   it("shows the section the way export will, including a missing note and a broken fence", () => {
@@ -40,7 +99,7 @@ describe("preview", () => {
     const node = section("# Where the rule stops\n\nSee.[^9]\n\n```java\nclass Foo {\n");
     const rendered = renderSection(node, [grand, parent]);
     expect(rendered.html).toContain("<h3>Inward</h3>");
-    expect(rendered.html).toMatch(/<h4[^>]*>Where the rule stops<\/h4>/);
+    expect(rendered.html).toMatch(/<h4[^>]*>\s*<span data-src="2">Where the rule stops<\/span><\/h4>/);
     expect(rendered.html).toContain("missing-fn");
     expect(rendered.html).toContain("broken-fence");
     expect(rendered.html).toContain("Foo");
@@ -59,7 +118,7 @@ describe("preview", () => {
     expect(one.html).toContain('id="fnref-inward-1"');
     expect(one.html).toContain('href="#fnref-inward-1"');
     expect(one.html).toContain('data-line="0"');
-    expect(one.html).toMatch(/data-line="2"[^>]*>Here\./);
+    expect(one.html).toMatch(/data-line="2"[^>]*>\s*<span data-src="16">Here\./);
     const both = renderBook([here, there]);
     expect(both.html).toContain('id="fn-inward-1"');
     expect(both.html).toContain('id="fn-outward-1"');
