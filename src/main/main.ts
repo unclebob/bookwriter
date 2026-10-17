@@ -38,6 +38,7 @@ import { divisionLabel, divisions, effectiveUnit, filePath, findNode, nodeWordCo
 import { joinPath, parentPath } from "../internals/path";
 import { PICTURE_EXTENSIONS, placePicture, resolvePictureSources } from "../internals/pictures";
 import { renderBook, renderGroup, renderSection } from "../ui/preview";
+import { previewClick } from "../ui/view";
 import { clampPreviewWidth, previewWidthFromPointer } from "../ui/split";
 import { allowBook, clearPlace, ensureCompanion, pandocDocx, readRefresh, setOpenBook, startupBookPath, stopCompanion, tauriFs, writePlace } from "../ui/tauriFs";
 import { dropRedo, emptyTrail, historyStep, noteVisit, redoVisit, undoVisit, type Trail } from "../ui/trail";
@@ -3150,9 +3151,11 @@ editButton.addEventListener("pointerdown", (event) => {
   ]);
 });
 document.querySelector("#btn-preview")!.addEventListener("click", () => {
-  previewOn = !previewOn;
+  const next = previewClick(selected()?.node ?? null, editing(), previewOn);
+  previewOn = next.previewOn;
   paintViewToggle();
-  drawPreview();
+  if (next.editFolderId) void choose(next.editFolderId, true);
+  else drawPreview();
 });
 paintViewToggle();
 document.querySelector("#btn-palette")!.addEventListener("click", openPalette);
