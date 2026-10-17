@@ -9,8 +9,6 @@ import {
   loadBook,
   manuscriptNodes,
   moveNode,
-  overwriteHeldNode,
-  overwriteHeldTitle,
   planMove,
   saveBookTitle,
   saveHeldNode,
@@ -20,7 +18,7 @@ import {
 } from "./book";
 import { FileHolds } from "./holds";
 import { exportBook } from "../export/export";
-import { filePath, type TreeNode } from "./model";
+import { filePath, serializeSection, type TreeNode } from "./model";
 import { nodeFs } from "../nodeFs";
 
 function tree(): TreeNode[] {
@@ -382,9 +380,35 @@ describe("the book folder", () => {
     const companion = remote.replace("---\n", "---\n") + "Remote.\n";
     await fs.writeText(path, remote.endsWith("\n") ? `${remote}Remote.\n` : companion);
     const result = await saveHeldNode(fs, holds, section, section.header, "Mine.\n");
-    expect(result).toBe("conflict");
+    expect(result).toBe("hold");
     expect(await fs.readText(path)).toContain("Remote.");
     expect(await fs.readText(path)).not.toContain("Mine.");
+
+    holds.acceptDisk(section.header.id, path, await fs.readText(path));
+    expect(await saveHeldNode(fs, holds, section, section.header, "Mine.\n")).toBe("saved");
+    expect(await fs.readText(path)).toContain("Mine.");
+    expect(await fs.readText(path)).not.toContain("Remote.");
+  });
+
+  it("does not install a snapshot after the buffer changes", async () => {
+    const root = await mkdtemp(join(tmpdir(), "bookwriter-"));
+    const fs = nodeFs();
+    await fs.mkdir(join(root, "manuscript"));
+    await fs.writeText(join(root, "book.yaml"), "title: Trial\n");
+    let book = await loadBook(fs, root);
+    await createNode(fs, book, null, "section", "Inward");
+    book = await loadBook(fs, root);
+    const section = book.nodes[0];
+    const path = filePath(section);
+    const holds = new FileHolds();
+    holds.replaceAll(new Map([[section.header.id, { path, bytes: await fs.readText(path) }]]));
+    holds.markEditing(section.header.id);
+    const before = await fs.readText(path);
+    const result = await saveHeldNode(fs, holds, section, section.header, "Mine.\n", () =>
+      serializeSection(section.header, "Mine!\n"),
+    );
+    expect(result).toBe("hold");
+    expect(await fs.readText(path)).toBe(before);
   });
 
   it("reports a write, and a save whose bytes are already on disk", async () => {
@@ -427,8 +451,11 @@ describe("the book folder", () => {
 
     holds.markEditing("book.yaml");
     await fs.writeText(path, "title: Theirs\n");
-    expect(await saveHeldTitle(fs, holds, book, "Mine")).toBe("conflict");
+    expect(await saveHeldTitle(fs, holds, book, "Mine")).toBe("hold");
     expect((await loadBook(fs, root)).title).toBe("Theirs");
+    holds.acceptDisk("book.yaml", path, await fs.readText(path));
+    expect(await saveHeldTitle(fs, holds, book, "Mine")).toBe("saved");
+    expect((await loadBook(fs, root)).title).toBe("Mine");
   });
 
   it("writes the book title it just read, and refuses when that file changes first", async () => {
@@ -470,8 +497,9 @@ describe("the book folder", () => {
     holds.markEditing(section.header.id);
     await fs.writeText(path, `${await fs.readText(path)}Remote.\n`);
     const header = { ...section.header, title: "Kept" };
-    expect(await saveHeldNode(fs, holds, section, header, "Mine.\n")).toBe("conflict");
-    await overwriteHeldNode(fs, holds, section, header, "Mine.\n");
+    expect(await saveHeldNode(fs, holds, section, header, "Mine.\n")).toBe("hold");
+    holds.acceptDisk(section.header.id, path, await fs.readText(path));
+    expect(await saveHeldNode(fs, holds, section, header, "Mine.\n")).toBe("saved");
     expect(section.header.title).toBe("Kept");
     expect(section.body).toBe("Mine.\n");
     const kept = await fs.readText(path);
@@ -481,16 +509,25 @@ describe("the book folder", () => {
 
     holds.markEditing("book.yaml");
     await fs.writeText(titlePath, "title: Theirs\n");
-    expect(await saveHeldTitle(fs, holds, book, "Mine")).toBe("conflict");
-    await overwriteHeldTitle(fs, holds, book, "Mine");
+    expect(await saveHeldTitle(fs, holds, book, "Mine")).toBe("hold");
+    holds.acceptDisk("book.yaml", titlePath, await fs.readText(titlePath));
+    expect(await saveHeldTitle(fs, holds, book, "Mine")).toBe("saved");
     expect(book.title).toBe("Mine");
     expect((await loadBook(fs, root)).title).toBe("Mine");
+  });
 
-    const unheld = new FileHolds();
-    await overwriteHeldNode(fs, unheld, section, section.header, "Fallback.\n");
-    expect(await fs.readText(path)).toContain("Fallback.\n");
-    await overwriteHeldTitle(fs, unheld, book, "Fallback");
-    expect((await loadBook(fs, root)).title).toBe("Fallback");
+  it("holds a save while the companion is busy", async () => {
+    const root = await mkdtemp(join(tmpdir(), "bookwriter-"));
+    const fs = nodeFs();
+    await fs.mkdir(join(root, "manuscript"));
+    await fs.writeText(join(root, "book.yaml"), "title: Trial\n");
+    const book = await loadBook(fs, root);
+    const path = join(root, "book.yaml");
+    const holds = new FileHolds();
+    holds.replaceAll(new Map([["book.yaml", { path, bytes: await fs.readText(path) }]]));
+    holds.markEditing("book.yaml");
+    expect(await saveHeldTitle(fs, holds, book, "Mine", undefined, true)).toBe("hold");
+    expect((await loadBook(fs, root)).title).toBe("Trial");
   });
 });
 

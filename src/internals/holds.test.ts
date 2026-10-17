@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { FileHolds, hasNewRefresh } from "./holds";
+import { FileHolds, hasNewRefresh, installDisk, saveInstall } from "./holds";
 
 const open = "manuscript/010-open.md";
 const other = "manuscript/020-other.md";
@@ -17,43 +17,30 @@ describe("file holds", () => {
     expect(effects).toEqual([{ kind: "reload", id: "other", path: other, bytes: "Remote" }]);
   });
 
-  it("refuses to save a dirty buffer over a companion write", () => {
+  it("ignores an edit of a file it has not seen", () => {
+    const holds = new FileHolds();
+    holds.markEditing("missing");
+    expect(holds.editing("missing")).toBe(false);
+    expect(holds.base("missing")).toBeNull();
+  });
+
+  it("keeps the base when a file is already being edited", () => {
     const holds = loaded();
     holds.markEditing("open");
-    expect(holds.planSave("open", "Remote", "Mine")).toEqual({ write: null });
-    expect(holds.conflict("open")).toBe(true);
-    expect(holds.planSave("open", "Remote", "Mine")).toEqual({ write: null });
+    holds.markEditing("open");
+    expect(holds.editing("open")).toBe(true);
+    expect(holds.base("open")).toBe("Hello");
   });
 
   it("tracks a file the window has not seen, and leaves a known file alone", () => {
     const holds = loaded();
     holds.ensureTracked("open", { path: "elsewhere.md", bytes: "Other" });
     holds.ensureTracked("fresh", { path: "manuscript/030-fresh.md", bytes: "New" });
-    expect(holds.planSave("open", "Hello", "Mine")).toEqual({ write: "Mine" });
-    expect(holds.planSave("fresh", "New", "Renamed")).toEqual({ write: "Renamed" });
+    expect(holds.base("open")).toBe("Hello");
+    expect(holds.base("fresh")).toBe("New");
   });
 
-  it("writes when disk is still the base", () => {
-    const holds = loaded();
-    holds.markEditing("open");
-    expect(holds.planSave("open", "Hello", "Mine")).toEqual({ write: "Mine" });
-    expect(holds.conflict("open")).toBe(false);
-  });
-
-  it("keeps mine by writing the buffer back and takes theirs without writing", () => {
-    const holds = loaded();
-    holds.markEditing("open");
-    holds.planSave("open", null, "Mine");
-    expect(holds.keepMine("open", "Mine")).toEqual({ path: open, bytes: "Mine", removePath: null });
-    expect(holds.conflict("open")).toBe(false);
-
-    holds.markEditing("open");
-    holds.observe(new Map([["other", { path: other, bytes: "There" }]]));
-    expect(holds.takeTheirs("open")).toEqual({ path: open, bytes: null });
-    expect(holds.conflict("open")).toBe(false);
-  });
-
-  it("follows a prefix rename of a clean section", () => {
+  it("follows a prefix rename of a clean section and keeps a missing edit", () => {
     const holds = loaded();
     const next = "manuscript/030-open.md";
     expect(
@@ -64,7 +51,24 @@ describe("file holds", () => {
         ]),
       ),
     ).toEqual([{ kind: "moved", id: "open", path: next }]);
-    expect(holds.conflict("open")).toBe(false);
+    expect(holds.editing("open")).toBe(false);
+
+    const editing = loaded();
+    editing.markEditing("open");
+    expect(
+      editing.observe(
+        new Map([
+          ["open", { path: next, bytes: "Hello" }],
+          ["other", { path: other, bytes: "There" }],
+        ]),
+      ),
+    ).toEqual([{ kind: "moved", id: "open", path: next }]);
+    expect(editing.base("open")).toBe("Hello");
+    expect(editing.observe(new Map([["other", { path: other, bytes: "There" }]]))).toEqual([
+      { kind: "removed", id: "open" },
+    ]);
+    expect(editing.editing("open")).toBe(false);
+    expect(editing.base("open")).toBeNull();
   });
 });
 
@@ -88,30 +92,57 @@ describe("refresh token", () => {
     expect(hasNewRefresh("1", "2")).toBe(true);
   });
 
-  it("reverts to the base when disk still matches, and not during a conflict", () => {
-    const holds = loaded();
-    holds.markEditing("open");
-    expect(holds.matchesBase("open", "Hello")).toBe(true);
-    expect(holds.revertToBase("open")).toBe("Hello");
-    expect(holds.editing("open")).toBe(false);
-    holds.markEditing("open");
-    holds.planSave("open", "Remote", "Mine");
-    expect(holds.matchesBase("open", "Remote")).toBe(false);
-    expect(holds.matchesBase("open", "Hello")).toBe(true);
-    expect(holds.revertToBase("open")).toBeNull();
-    expect(holds.conflict("open")).toBe(true);
+});
+
+describe("installing a save", () => {
+  const ready = {
+    busy: false,
+    base: "Hello",
+    disk: "Hello",
+    diskNow: "Hello",
+    snapshot: "Mine",
+    buffer: "Mine",
+  };
+
+  it("holds while the companion is busy and while the buffer has moved", () => {
+    expect(saveInstall({ ...ready, busy: true })).toBe("hold");
+    expect(saveInstall({ ...ready, buffer: "Mine!" })).toBe("hold");
+    expect(saveInstall({ ...ready, diskNow: "Remote" })).toBe("hold");
+    expect(saveInstall({ ...ready, disk: "Remote", diskNow: "Remote" })).toBe("hold");
+    expect(saveInstall({ ...ready, base: null, disk: null, diskNow: null })).toBe("write");
+    expect(saveInstall({ ...ready, disk: null, diskNow: null })).toBe("hold");
   });
 
-  it("keeps a dirty buffer on a new token, and on refresh only when disk moved", () => {
+  it("writes a stable buffer when disk is still the base, and skips a disk that already matches", () => {
+    expect(saveInstall(ready)).toBe("write");
+    expect(saveInstall({ ...ready, disk: "Mine", diskNow: "Mine" })).toBe("same");
+  });
+
+  it("writes the held buffer once the companion bytes are accepted as the base", () => {
     const holds = loaded();
     holds.markEditing("open");
-    expect(holds.keepOpenBuffer("open", "token", "Hello")).toBe(true);
-    expect(holds.keepOpenBuffer("open", "revert", "Hello")).toBe(false);
-    expect(holds.keepOpenBuffer("open", "token", "Remote")).toBe(true);
-    expect(holds.keepOpenBuffer("open", "revert", "Remote")).toBe(true);
-    holds.planSave("open", "Remote", "Mine");
-    expect(holds.keepOpenBuffer("open", "token", "Hello")).toBe(true);
-    expect(holds.keepOpenBuffer("open", "revert", "Hello")).toBe(false);
-    expect(holds.keepOpenBuffer("quiet", "token", "Hello")).toBe(false);
+    holds.observe(new Map([["open", { path: open, bytes: "Remote" }]]));
+    expect(holds.editing("open")).toBe(true);
+    expect(holds.base("open")).toBe("Hello");
+    expect(
+      saveInstall({ ...ready, base: holds.base("open"), disk: "Remote", diskNow: "Remote" }),
+    ).toBe("hold");
+    holds.acceptDisk("open", open, "Remote");
+    expect(holds.base("open")).toBe("Remote");
+    expect(
+      saveInstall({ ...ready, base: holds.base("open"), disk: "Remote", diskNow: "Remote" }),
+    ).toBe("write");
+    holds.noteWrite("open", open, "Mine");
+    expect(holds.editing("open")).toBe(false);
+    expect(holds.base("open")).toBe("Mine");
+  });
+
+  it("installs companion bytes only when the buffer is still the base", () => {
+    expect(installDisk({ base: "Hello", snapshot: null, buffer: null })).toBe("install");
+    expect(installDisk({ base: "Hello", snapshot: null, buffer: "Mine" })).toBe("install");
+    expect(installDisk({ base: "Hello", snapshot: "Hello", buffer: null })).toBe("install");
+    expect(installDisk({ base: "Hello", snapshot: "Hello", buffer: "Hello" })).toBe("install");
+    expect(installDisk({ base: "Hello", snapshot: "Mine", buffer: "Mine" })).toBe("hold");
+    expect(installDisk({ base: "Hello", snapshot: "Hello", buffer: "Hello!" })).toBe("hold");
   });
 });

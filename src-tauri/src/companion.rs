@@ -602,11 +602,13 @@ twice does not ask again. Write every changed file before the token.\n\
 Bookwriter refreshes when that token is new, and when the writer presses\n\
 Refresh. It does not refresh on a file change alone.\n\
 \n\
-If place.json names a file the writer is mid-edit in, the app keeps their\n\
-keystrokes on screen and keeps your bytes on disk. It will not save their\n\
-buffer over your write, and it will not throw their keystrokes away. You\n\
-cannot see that buffer. Do not try to merge it. A file they are not editing\n\
-is reloaded, including another section while this one is open.\n\
+If place.json names a file the writer is mid-edit in, the app holds their\n\
+buffer and does not save it while you are still changing files. Write every\n\
+file, then the refresh token. After that token, the app installs your bytes\n\
+only when their buffer has not changed. When it has changed, the app holds\n\
+that buffer and saves it, replacing your bytes for that file. You cannot see\n\
+that buffer. Do not try to merge it. A file they are not editing is reloaded,\n\
+including another section while this one is open.\n\
 \n\
 Do not start Bookwriter. Closing its window stops only this companion.\n\
 Do not commit or push unless asked.\n";

@@ -1,4 +1,4 @@
-import { FileHolds } from "./holds";
+import { FileHolds, saveInstall } from "./holds";
 import {
   assignPrefixes,
   collectIds,
@@ -177,20 +177,15 @@ async function loadGroup(
   return { kind: "group", header, body, prefix, slug, dir, entryName, children };
 }
 
-export type HeldSave = "saved" | "conflict" | "same";
+export type HeldSave = "saved" | "hold" | "same";
 
 export async function saveNode(fs: Fs, node: TreeNode, header: Header, body: string): Promise<void> {
   const holds = new FileHolds();
   const path = filePath(node);
-  let current: string | null = null;
-  try {
-    current = await fs.readText(path);
-  } catch {
-    current = null;
-  }
+  const current = await readOrNull(fs, path);
   if (current !== null) holds.replaceAll(new Map([[node.header.id, { path, bytes: current }]]));
   const result = await saveHeldNode(fs, holds, node, header, body);
-  if (result === "conflict") throw new Error(`Could not save ${path}.`);
+  if (result === "hold") throw new Error(`Could not save ${path}.`);
 }
 
 export async function saveHeldNode(
@@ -199,78 +194,67 @@ export async function saveHeldNode(
   node: TreeNode,
   header: Header,
   body: string,
+  live?: () => string,
+  busy?: boolean,
 ): Promise<HeldSave> {
   const kept: Header = { ...header, id: node.header.id };
-  const next = serializeSection(kept, body);
-  const path = filePath(node);
-  let disk: string | null = null;
-  try {
-    disk = await fs.readText(path);
-  } catch {
-    disk = null;
+  const snapshot = serializeSection(kept, body);
+  const buffer = live ? live() : snapshot;
+  if (buffer === snapshot) {
+    node.header = kept;
+    node.body = body;
   }
-  const plan = holds.planSave(node.header.id, disk, next);
-  if (plan.write !== null) await fs.writeText(path, plan.write);
-  node.header = kept;
-  node.body = body;
-  if (plan.write === null && disk !== next) return "conflict";
-  if (plan.write === null) return "same";
-  return "saved";
+  return settle(fs, holds, node.header.id, filePath(node), snapshot, buffer, suppliedBusy(busy));
 }
 
 export async function saveBookTitle(fs: Fs, book: Book, title: string): Promise<void> {
   const holds = new FileHolds();
   const path = joinPath(book.root, "book.yaml");
-  let current: string | null = null;
-  try {
-    current = await fs.readText(path);
-  } catch {
-    current = null;
-  }
+  const current = await readOrNull(fs, path);
   if (current !== null) holds.replaceAll(new Map([["book.yaml", { path, bytes: current }]]));
   const result = await saveHeldTitle(fs, holds, book, title);
-  if (result === "conflict") throw new Error(`Could not save ${path}.`);
+  if (result === "hold") throw new Error(`Could not save ${path}.`);
 }
 
-export async function saveHeldTitle(fs: Fs, holds: FileHolds, book: Book, title: string): Promise<HeldSave> {
-  const next = serializeTitle(title);
-  const path = joinPath(book.root, "book.yaml");
-  const disk = await readOrNull(fs, path);
-  const plan = holds.planSave("book.yaml", disk, next);
-  if (plan.write !== null) await fs.writeText(path, plan.write);
-  book.title = title;
-  if (plan.write === null && disk !== next) return "conflict";
-  if (plan.write === null) return "same";
-  return "saved";
-}
-
-export async function overwriteHeldNode(
+export async function saveHeldTitle(
   fs: Fs,
   holds: FileHolds,
-  node: TreeNode,
-  header: Header,
-  body: string,
-): Promise<void> {
-  const kept: Header = { ...header, id: node.header.id };
-  const next = serializeSection(kept, body);
-  const keptFile = holds.keepMine(node.header.id, next);
-  const path = keptFile.path || filePath(node);
-  if (keptFile.removePath) await fs.remove(keptFile.removePath);
-  await fs.writeText(path, keptFile.bytes);
-  node.header = kept;
-  node.body = body;
+  book: Book,
+  title: string,
+  live?: () => string,
+  busy?: boolean,
+): Promise<HeldSave> {
+  const snapshot = serializeTitle(title);
+  const buffer = live ? live() : snapshot;
+  if (buffer === snapshot) book.title = title;
+  return settle(fs, holds, "book.yaml", joinPath(book.root, "book.yaml"), snapshot, buffer, suppliedBusy(busy));
 }
 
-export async function overwriteHeldTitle(fs: Fs, holds: FileHolds, book: Book, title: string): Promise<void> {
-  const next = serializeTitle(title);
-  const keptFile = holds.keepMine("book.yaml", next);
-  const path = keptFile.path || joinPath(book.root, "book.yaml");
-  if (keptFile.removePath) await fs.remove(keptFile.removePath);
-  await fs.writeText(path, keptFile.bytes);
-  book.title = title;
+function suppliedBusy(busy: boolean | undefined): boolean {
+  if (busy === undefined) return false;
+  return busy;
 }
 
-async function readOrNull(fs: Fs, path: string): Promise<string | null> {
+async function settle(
+  fs: Fs,
+  holds: FileHolds,
+  id: string,
+  path: string,
+  snapshot: string,
+  buffer: string,
+  busy: boolean,
+): Promise<HeldSave> {
+  const disk = await readOrNull(fs, path);
+  const diskNow = await readOrNull(fs, path);
+  const decision = saveInstall({ busy, base: holds.base(id), disk, diskNow, snapshot, buffer });
+  if (decision === "hold") return "hold";
+  if (decision === "write") await fs.writeText(path, snapshot);
+  holds.noteWrite(id, path, snapshot);
+  if (decision === "write") return "saved";
+  return "same";
+}
+
+export async function readOrNull(fs: Fs, path: string): Promise<string | null> {
   try {
     return await fs.readText(path);
   } catch {

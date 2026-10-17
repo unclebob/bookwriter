@@ -18,14 +18,14 @@ import {
   loadBook,
   manuscriptNodes,
   moveNode,
-  overwriteHeldNode,
-  overwriteHeldTitle,
+  readOrNull,
   saveHeldNode,
   saveHeldTitle,
   type Book,
   type DropZone,
+  type HeldSave,
 } from "../internals/book";
-import { FileHolds, hasNewRefresh, type HeldFile } from "../internals/holds";
+import { FileHolds, hasNewRefresh, installDisk, type HeldFile } from "../internals/holds";
 import { bodyPlace, bookRelative, createPlaceWriter, manuscriptPlace, readingPlace, titlePlace } from "../internals/place";
 import { COMMANDS, applyCommand, changedSpan, latestLanguage, type CommandId, type MarkupCommand } from "../ui/commands";
 import { exportBook, exportChapter, exportDocxFiles, type ChapterExport } from "../export/export";
@@ -34,7 +34,7 @@ import { chapterPdf, exportPdfWithPictures } from "../export/pdf";
 import { rasterizePicture } from "../ui/rasterize";
 import { formatAccelerator } from "../ui/keys";
 import { blockAtLine, lineOffset, offsetFraction, scrollToSpot, sourceOffset } from "../ui/locate";
-import { divisionLabel, divisions, effectiveUnit, filePath, findNode, nodeWordCount, parseSection, parseTitle, slugify, UNITS, walk, type Division, type Header, type Status, type TreeNode, type Unit } from "../internals/model";
+import { divisionLabel, divisions, effectiveUnit, filePath, findNode, nodeWordCount, parseSection, serializeSection, serializeTitle, slugify, UNITS, walk, type Division, type Header, type Status, type TreeNode, type Unit } from "../internals/model";
 import { joinPath, parentPath } from "../internals/path";
 import { PICTURE_EXTENSIONS, placePicture, resolvePictureSources } from "../internals/pictures";
 import { renderBook, renderGroup, renderSection } from "../ui/preview";
@@ -51,12 +51,10 @@ const places = createPlaceWriter(
 );
 let appliedToken: string | null = null;
 let companionWatching = false;
+let companionBusy = false;
 let preserved: TreeNode | null = null;
 const bookTitle = document.querySelector<HTMLInputElement>("#book-title")!;
 const saveState = document.querySelector<HTMLElement>("#save-state")!;
-const conflictStatus = document.querySelector<HTMLElement>("#conflict-status")!;
-const keepMineButton = document.querySelector<HTMLButtonElement>("#keep-mine")!;
-const takeTheirsButton = document.querySelector<HTMLButtonElement>("#take-theirs")!;
 const warningsEl = document.querySelector<HTMLElement>("#warnings")!;
 const outlineEl = document.querySelector<HTMLElement>("#outline")!;
 const inspector = document.querySelector<HTMLFormElement>("#inspector")!;
@@ -94,9 +92,12 @@ const collapsed = new Set<string>();
 let editingProse = false;
 let previewOn = true;
 let dirty = false;
+let titleDirty = false;
 let suppress = false;
 let navigating = false;
-let saveTimer = 0;
+let saveFlight: Promise<void> | null = null;
+const parked = new Set<string>();
+const SAVE_EVERY_MS = 400;
 let paletteIndex = 0;
 let pendingHistory: "undo" | "redo" | null = null;
 let historyBusy = false;
@@ -201,8 +202,6 @@ const editorExtensions = [
     dirty = true;
     if (navigating) return;
     saveState.textContent = "Unsaved";
-    window.clearTimeout(saveTimer);
-    saveTimer = window.setTimeout(() => void flush(), 400);
     drawPreview();
     paintWordCount();
   }),
@@ -274,9 +273,45 @@ function headerFromForm(node: TreeNode): Header {
   };
 }
 
-function cancelSave(): void {
-  window.clearTimeout(saveTimer);
-  saveTimer = 0;
+let savesWatching = false;
+
+function watchSaves(): void {
+  if (savesWatching) return;
+  armSaves();
+}
+
+function armSaves(): void {
+  savesWatching = true;
+  window.setInterval(saveOnCadence, SAVE_EVERY_MS);
+}
+
+function saveOnCadence(): void {
+  if (cadenceSkips()) return;
+  void flush();
+}
+
+function cadenceSkips(): boolean {
+  return saveBlocked() || nothingToSave();
+}
+
+function saveBlocked(): boolean {
+  return navigating || companionBusy;
+}
+
+function nothingToSave(): boolean {
+  return saveInFlight() || !saveWaiting();
+}
+
+function saveInFlight(): boolean {
+  return saveFlight !== null;
+}
+
+function saveWaiting(): boolean {
+  return dirty || titleOrParked();
+}
+
+function titleOrParked(): boolean {
+  return titleDirty || parked.size > 0;
 }
 
 function loadDocument(body: string, resetHistory: boolean): void {
@@ -323,33 +358,214 @@ function showCurrent(): void {
 }
 
 async function flush(): Promise<void> {
-  cancelSave();
-  const current = selected();
-  if (cannotSave(current)) return;
-  await saveCurrent(current);
+  if (flushRefused()) return;
+  await joinOrStart();
 }
 
-function cannotSave(current: Selection | null): current is null {
-  return !hasSaveTarget(current) || !dirty;
+function flushRefused(): boolean {
+  return book == null || companionBusy;
 }
 
-function hasSaveTarget(current: Selection | null): boolean {
-  return book != null && current != null;
-}
-
-async function saveCurrent(current: Selection): Promise<void> {
-  holds.markEditing(current.node.header.id);
-  const result = await saveHeldNode(fs, holds, current.node, headerFromForm(current.node), flushBody(current));
-  if (result === "conflict") {
-    dirty = true;
-    saveState.textContent = "Unsaved";
-    paintConflict(true);
+async function joinOrStart(): Promise<void> {
+  if (saveFlight) {
+    await saveFlight;
     return;
   }
-  dirty = false;
-  saveState.textContent = "Saved";
-  paintConflict(holds.anyConflict());
+  await startFlush();
+}
+
+async function startFlush(): Promise<void> {
+  saveFlight = runFlush();
+  try {
+    await saveFlight;
+  } finally {
+    saveFlight = null;
+  }
+}
+
+async function runFlush(): Promise<void> {
+  if (await flushPaused()) return;
+  await writeOpenFiles();
+}
+
+async function writeOpenFiles(): Promise<void> {
+  await saveOpenBuffer();
+  await saveOpenTitle();
+  await saveParked();
+  paintSaved();
+}
+
+async function flushPaused(): Promise<boolean> {
+  if (flushRefused()) return true;
+  return batchPending();
+}
+
+async function batchPending(): Promise<boolean> {
+  if (await tokenPending()) return true;
+  return companionBusy;
+}
+
+async function tokenPending(): Promise<boolean> {
+  return hasNewRefresh(appliedToken, await quietRefresh());
+}
+
+async function quietRefresh(): Promise<string | null> {
+  try {
+    return await readRefresh();
+  } catch {
+    return null;
+  }
+}
+
+async function saveOpenBuffer(): Promise<void> {
+  const current = selected();
+  if (!openToSave(current)) return;
+  await writeOpen(current);
+}
+
+function openToSave(current: Selection | null): current is Selection {
+  return bookOpenForSave() && current != null;
+}
+
+function bookOpenForSave(): boolean {
+  return book != null && sectionPending();
+}
+
+function sectionPending(): boolean {
+  return dirty || openParked();
+}
+
+function openParked(): boolean {
+  const id = selectedNodeId();
+  if (!id) return false;
+  return parked.has(id);
+}
+
+function selectedNodeId(): string | null {
+  const current = selected();
+  if (!current) return null;
+  return current.node.header.id;
+}
+
+async function writeOpen(current: Selection): Promise<void> {
+  rememberOpen();
+  const header = headerFromForm(current.node);
+  const body = flushBody(current);
+  const id = current.node.header.id;
+  const result = await saveHeldNode(fs, holds, current.node, header, body, () => liveSection(current));
+  noteBufferResult(current, header, body, id, result);
+}
+
+function noteBufferResult(current: Selection, header: Header, body: string, id: string, result: HeldSave): void {
+  if (result === "hold") {
+    holdOpen(id);
+    return;
+  }
+  releaseOpen(current, header, body, id);
+}
+
+function holdOpen(id: string): void {
+  dirty = true;
+  parked.add(id);
+}
+
+function releaseOpen(current: Selection, header: Header, body: string, id: string): void {
+  dirty = liveSection(current) !== serializeSection({ ...header, id }, body);
+  if (!dirty) parked.delete(id);
   paintWordCount();
+}
+
+function liveSection(current: Selection): string {
+  return serializeSection(headerFromForm(current.node), flushBody(current));
+}
+
+function rememberOpen(): void {
+  const current = selected();
+  if (!current) return;
+  storeOpen(current);
+}
+
+function storeOpen(current: Selection): void {
+  current.node.header = headerFromForm(current.node);
+  if (!editing()) return;
+  current.node.body = editor.state.doc.toString();
+}
+
+async function saveOpenTitle(): Promise<void> {
+  if (!titleOpen()) return;
+  await writeTitle();
+}
+
+function titleOpen(): boolean {
+  return book != null && titleDirty;
+}
+
+async function writeTitle(): Promise<void> {
+  const title = bookTitle.value;
+  const result = await saveHeldTitle(fs, holds, book!, title, () => serializeTitle(bookTitle.value));
+  noteTitle(title, result);
+}
+
+function noteTitle(title: string, result: HeldSave): void {
+  if (result === "hold") {
+    titleDirty = true;
+    return;
+  }
+  finishTitle(title);
+}
+
+function finishTitle(title: string): void {
+  titleDirty = bookTitle.value !== title;
+  if (titleDirty) return;
+  document.title = titled(title);
+}
+
+async function saveParked(): Promise<void> {
+  if (!book) return;
+  await saveParkedIds(selectedNodeId());
+}
+
+async function saveParkedIds(openId: string | null): Promise<void> {
+  for (const id of [...parked]) await saveParkedId(id, openId);
+}
+
+async function saveParkedId(id: string, openId: string | null): Promise<void> {
+  if (id === openId) return;
+  await saveClosed(id);
+}
+
+async function saveClosed(id: string): Promise<void> {
+  const node = parkedNode(id);
+  if (!node) {
+    parked.delete(id);
+    return;
+  }
+  await writeParked(node);
+}
+
+function parkedNode(id: string): TreeNode | null {
+  const found = findNode(book!.nodes, id);
+  if (!found) return null;
+  return found.node;
+}
+
+async function writeParked(node: TreeNode): Promise<void> {
+  const result = await saveHeldNode(fs, holds, node, node.header, node.body);
+  if (result === "hold") return;
+  parked.delete(node.header.id);
+}
+
+function paintSaved(): void {
+  saveState.textContent = savedLabel();
+}
+
+function savedLabel(): string {
+  if (unsaved()) return "Unsaved";
+  return "Saved";
+}
+
+function unsaved(): boolean {
+  return dirty || titleOrParked();
 }
 
 function flushBody(current: Selection): string {
@@ -464,7 +680,6 @@ async function tryLand(visit: Visit): Promise<boolean> {
 }
 
 async function prepareLand(visit: Visit): Promise<boolean> {
-  cancelSave();
   await flushTwice();
   if (cannotLandOn(visit)) return false;
   await settleVisit(visit);
@@ -531,7 +746,7 @@ async function markDirtyAndFlush(): Promise<void> {
 
 function markSaved(): void {
   dirty = false;
-  saveState.textContent = "Saved";
+  paintSaved();
 }
 
 function showPictures(html: string): string {
@@ -1307,7 +1522,6 @@ function notShowingRead(group: boolean): boolean {
 }
 
 async function choose(id: string, prose: boolean): Promise<void> {
-  if (blockedByConflict(id, prose)) return;
   if (sameSelection(id, prose)) {
     showCurrent();
     publishPlace();
@@ -1316,15 +1530,6 @@ async function choose(id: string, prose: boolean): Promise<void> {
   await switchSelection(id, prose);
   showCurrent();
   publishPlace();
-}
-
-function blockedByConflict(id: string, prose: boolean): boolean {
-  return openFileConflict() && !sameSelection(id, prose);
-}
-
-function openFileConflict(): boolean {
-  const id = selected()?.node.header.id ?? preserved?.header.id;
-  return id != null && holds.conflict(id);
 }
 
 function sameSelection(id: string, prose: boolean): boolean {
@@ -1341,12 +1546,23 @@ async function switchSelection(id: string, prose: boolean): Promise<void> {
 }
 
 async function commitLeaving(id: string, prose: boolean): Promise<void> {
-  cancelSave();
+  rememberOpen();
   await flushTwice();
+  parkLeaving();
   noteLeaving();
   selectedId = id;
   editingProse = prose;
   loadSelectedBody();
+}
+
+function parkLeaving(): void {
+  const leaving = selectedNodeId();
+  if (!shouldPark(leaving)) return;
+  parked.add(leaving);
+}
+
+function shouldPark(leaving: string | null): leaving is string {
+  return leaving != null && dirty;
 }
 
 function noteLeaving(): void {
@@ -1359,22 +1575,112 @@ async function refresh(keep: string | null, resetHistory = false): Promise<void>
   await reloadBook(keep, resetHistory);
 }
 
+type OpenCapture = { id: string; header: Header; body: string };
+
+type ReloadCapture = {
+  kept: OpenCapture | null;
+  keptTitle: string | null;
+  previousId: string | null;
+  previousProse: boolean;
+};
+
 async function reloadBook(keep: string | null, resetHistory: boolean): Promise<void> {
-  const previousId = selectedId;
-  const previousProse = editingProse;
+  const captured = captureReload();
   const loaded = await loadBook(fs, book!.root);
+  finishReload(keep, resetHistory, captured, loaded);
+}
+
+function captureReload(): ReloadCapture {
+  return {
+    kept: dirtyCapture(),
+    keptTitle: dirtyTitle(),
+    previousId: selectedId,
+    previousProse: editingProse,
+  };
+}
+
+function dirtyCapture(): OpenCapture | null {
+  if (!dirty) return null;
+  return captureOpen();
+}
+
+function dirtyTitle(): string | null {
+  if (!titleDirty) return null;
+  return bookTitle.value;
+}
+
+function finishReload(keep: string | null, resetHistory: boolean, captured: ReloadCapture, loaded: Book): void {
   book = loaded;
+  restoreKept(captured.kept);
   selectedId = keptId(keep);
-  const changed = selectionChanged(resetHistory, previousId, previousProse);
+  const changed = selectionChanged(resetHistory, captured.previousId, captured.previousProse);
+  clearTrailIf(changed);
+  restoreTitle(captured.keptTitle, loaded);
+  loadRefreshedDocument(changed);
+  markRestored(captured.kept);
+  paintReload(loaded);
+}
+
+function restoreKept(kept: OpenCapture | null): void {
+  if (!kept) return;
+  restoreCaptured(kept);
+}
+
+function clearTrailIf(changed: boolean): void {
   if (changed) trail = emptyTrail();
+}
+
+function restoreTitle(keptTitle: string | null, loaded: Book): void {
+  if (keptTitle !== null) keepTitleText(keptTitle);
+  else showLoadedTitle(loaded);
+}
+
+function keepTitleText(title: string): void {
+  book!.title = title;
+  bookTitle.value = title;
+}
+
+function showLoadedTitle(loaded: Book): void {
   bookTitle.value = loaded.title;
   document.title = titled(loaded.title);
-  loadRefreshedDocument(changed);
+  titleDirty = false;
+}
+
+function markRestored(kept: OpenCapture | null): void {
+  if (!kept) return;
+  dirty = true;
+}
+
+function paintReload(loaded: Book): void {
   renderOutline();
   fillInspector();
   drawReading();
   drawPreview();
   showWarnings(loaded.warnings);
+}
+
+function captureOpen(): OpenCapture | null {
+  const current = selected();
+  if (!current) return null;
+  rememberOpen();
+  return { id: current.node.header.id, header: { ...current.node.header }, body: current.node.body };
+}
+
+function restoreCaptured(kept: OpenCapture): void {
+  const found = findCaptured(kept.id);
+  if (!found) return;
+  placeCaptured(found.node, kept);
+}
+
+function findCaptured(id: string): { node: TreeNode } | null {
+  if (!book) return null;
+  return findNode(book.nodes, id);
+}
+
+function placeCaptured(node: TreeNode, kept: OpenCapture): void {
+  node.header = kept.header;
+  node.body = kept.body;
+  parked.add(kept.id);
 }
 
 function keptId(keep: string | null): string {
@@ -1449,6 +1755,7 @@ async function openCanonical(full: string): Promise<void> {
   appliedToken = await readRefresh().catch(() => null);
   void ensureCompanion().catch((error: unknown) => showWarnings([String(error)]));
   watchCompanion();
+  watchSaves();
   publishPlace();
   if (pictureWarning) showWarnings([...bookWarnings(), pictureWarning]);
 }
@@ -1496,71 +1803,240 @@ async function finishRefresh(): Promise<void> {
 /** Read the files again. The open buffer is not written first, so an outside edit is what shows. */
 async function showDisk(): Promise<void> {
   if (!book) return;
-  cancelSave();
+  await readDisk();
+}
+
+async function readDisk(): Promise<void> {
   navigating = true;
   try {
     await applyFromDisk("revert");
-  } catch (error) {
-    resumeSave();
-    throw error;
   } finally {
     navigating = false;
   }
-  cancelSave();
   // A parked visit still holds the buffer from before this read. Undo would write it back.
   trail = emptyTrail();
-  if (dirty) resumeSave();
-  else markSaved();
-  if (editing()) editor.focus();
+  focusEditing();
   publishPlace();
 }
 
+function focusEditing(): void {
+  if (editing()) editor.focus();
+}
+
+type OpenMine = { header: Header; body: string };
+
+type RefreshCapture = {
+  openNode: TreeNode | null;
+  openId: string | null;
+  bodySnapshot: string | null;
+  titleSnapshot: string | null;
+  previousId: string | null;
+  previousProse: boolean;
+};
+
 async function applyFromDisk(reason: "token" | "revert"): Promise<void> {
   if (!book) return;
-  const open = selected();
-  const openNode = open?.node ?? preserved;
-  const openId = openNode?.header.id ?? null;
-  const disk = openNode ? await readMaybe(filePath(openNode)) : null;
-  if (openId != null && reason === "revert" && !holds.conflict(openId) && holds.matchesBase(openId, disk)) {
-    holds.revertToBase(openId);
-  }
-  const keepBody = openId != null && holds.keepOpenBuffer(openId, reason, disk);
-  const mine = keepBody && openNode
-    ? { header: headerFromForm(openNode), body: shownBody(openNode) }
-    : null;
-  const titlePath = joinPath(book.root, "book.yaml");
-  const titleDisk = await readMaybe(titlePath);
-  if (reason === "revert" && !holds.conflict("book.yaml") && holds.matchesBase("book.yaml", titleDisk)) {
-    holds.revertToBase("book.yaml");
-  }
-  const keepTitle = holds.keepOpenBuffer("book.yaml", reason, titleDisk);
-  const typedTitle = bookTitle.value;
-  const previousId = selectedId;
-  const previousProse = editingProse;
-  const loaded = await loadBook(fs, book.root);
-  holds.observe(await snapshotFiles(loaded));
+  await replaceFromDisk(reason);
+}
+
+async function replaceFromDisk(reason: "token" | "revert"): Promise<void> {
+  const captured = captureRefresh();
+  const loaded = await loadBook(fs, book!.root);
+  const files = await snapshotFiles(loaded);
+  finishRefreshLoad(reason, captured, loaded, files);
+}
+
+function captureRefresh(): RefreshCapture {
+  rememberOpen();
+  const openNode = openNodeOf(selected());
+  return {
+    openNode,
+    openId: nodeId(openNode),
+    bodySnapshot: bodySnapshotOf(),
+    titleSnapshot: titleSnapshotOf(),
+    previousId: selectedId,
+    previousProse: editingProse,
+  };
+}
+
+function openNodeOf(open: Selection | null): TreeNode | null {
+  if (open) return open.node;
+  return preserved;
+}
+
+function bodySnapshotOf(): string | null {
+  if (!dirty) return null;
+  return sectionSnapshot();
+}
+
+function titleSnapshotOf(): string | null {
+  if (!titleDirty) return null;
+  return serializeTitle(bookTitle.value);
+}
+
+function finishRefreshLoad(
+  reason: "token" | "revert",
+  captured: RefreshCapture,
+  loaded: Book,
+  files: Map<string, HeldFile>,
+): void {
+  const keepBody = keptBuffer(reason, captured.openId, captured.bodySnapshot);
+  const keepTitle = keptTitle(reason, captured.titleSnapshot);
+  const mine = capturedMine(keepBody, captured.openNode);
+  holds.observe(files);
   book = loaded;
-  if (keepTitle) {
-    book.title = typedTitle;
-    bookTitle.value = typedTitle;
-  } else {
-    bookTitle.value = book.title;
-    document.title = titled(book.title);
-  }
-  if (mine && openId && openNode) {
-    restoreMine(openId, openNode, mine);
-  } else {
-    preserved = null;
-    selectedId = keptId(previousId);
-    editingProse = previousProse;
-    loadRefreshedDocument(selectionChanged(false, previousId, previousProse));
-  }
+  installTitle(keepTitle, files);
+  installBody(mine, captured.openId, captured.openNode, files, captured.previousId, captured.previousProse);
+  paintRefresh();
+}
+
+function paintRefresh(): void {
   renderOutline();
   fillInspector();
   drawReading();
   drawPreview();
-  paintConflict(holds.anyConflict());
-  if (!keepBody && !dirty) markSaved();
+  paintSaved();
+}
+
+function capturedMine(keepBody: boolean, openNode: TreeNode | null): OpenMine | null {
+  if (!keepBody) return null;
+  return mineFrom(openNode);
+}
+
+function mineFrom(openNode: TreeNode | null): OpenMine | null {
+  if (!openNode) return null;
+  return { header: headerFromForm(openNode), body: shownBody(openNode) };
+}
+
+function installTitle(keepTitle: boolean, files: Map<string, HeldFile>): void {
+  if (keepTitle) acceptTitle(files);
+  else showBookTitle(files);
+}
+
+function acceptTitle(files: Map<string, HeldFile>): void {
+  book!.title = bookTitle.value;
+  const titleFile = files.get("book.yaml");
+  holds.acceptDisk("book.yaml", titlePathOf(titleFile), titleBytes(titleFile));
+  titleDirty = true;
+}
+
+function titlePathOf(file: HeldFile | undefined): string {
+  if (file) return file.path;
+  return joinPath(book!.root, "book.yaml");
+}
+
+function titleBytes(file: HeldFile | undefined): string | null {
+  if (file) return file.bytes;
+  return null;
+}
+
+function showBookTitle(files: Map<string, HeldFile>): void {
+  bookTitle.value = book!.title;
+  document.title = titled(book!.title);
+  titleDirty = false;
+  noteTitleFile(files.get("book.yaml"));
+}
+
+function noteTitleFile(file: HeldFile | undefined): void {
+  if (!file) return;
+  holds.noteWrite("book.yaml", file.path, file.bytes);
+}
+
+function installBody(
+  mine: OpenMine | null,
+  openId: string | null,
+  openNode: TreeNode | null,
+  files: Map<string, HeldFile>,
+  previousId: string | null,
+  previousProse: boolean,
+): void {
+  if (keptMine(mine, openId, openNode)) acceptBody(openId!, openNode!, mine!, files);
+  else showBody(openId, files, previousId, previousProse);
+}
+
+function keptMine(mine: OpenMine | null, openId: string | null, openNode: TreeNode | null): boolean {
+  return mine != null && nodeReady(openId, openNode);
+}
+
+function nodeReady(openId: string | null, openNode: TreeNode | null): boolean {
+  return openId != null && openNode != null;
+}
+
+function acceptBody(openId: string, openNode: TreeNode, mine: OpenMine, files: Map<string, HeldFile>): void {
+  restoreMine(openId, openNode, mine);
+  holds.acceptDisk(openId, diskPath(openId, openNode, files), diskBytes(openId, files));
+  dirty = true;
+  parked.add(openId);
+}
+
+function diskPath(openId: string, openNode: TreeNode, files: Map<string, HeldFile>): string {
+  const file = files.get(openId);
+  if (file) return file.path;
+  return filePath(openNode);
+}
+
+function diskBytes(openId: string, files: Map<string, HeldFile>): string | null {
+  const file = files.get(openId);
+  if (file) return file.bytes;
+  return null;
+}
+
+function showBody(
+  openId: string | null,
+  files: Map<string, HeldFile>,
+  previousId: string | null,
+  previousProse: boolean,
+): void {
+  preserved = null;
+  selectedId = keptId(previousId);
+  editingProse = previousProse;
+  loadRefreshedDocument(selectionChanged(false, previousId, previousProse));
+  noteOpenFile(openId, files);
+  dropParked(openId);
+  dirty = false;
+}
+
+function noteOpenFile(openId: string | null, files: Map<string, HeldFile>): void {
+  if (!openId) return;
+  noteHeldFile(openId, files.get(openId));
+}
+
+function noteHeldFile(openId: string, file: HeldFile | undefined): void {
+  if (!file) return;
+  holds.noteWrite(openId, file.path, file.bytes);
+}
+
+function dropParked(openId: string | null): void {
+  if (!openId) return;
+  parked.delete(openId);
+}
+
+function keptBuffer(reason: "token" | "revert", openId: string | null, snapshot: string | null): boolean {
+  if (skipBuffer(reason, openId)) return false;
+  return heldSection(openId!, snapshot);
+}
+
+function skipBuffer(reason: "token" | "revert", openId: string | null): boolean {
+  return reason !== "token" || openId === null;
+}
+
+function heldSection(openId: string, snapshot: string | null): boolean {
+  return installDisk({ base: holds.base(openId), snapshot, buffer: sectionSnapshot() }) === "hold";
+}
+
+function keptTitle(reason: "token" | "revert", snapshot: string | null): boolean {
+  if (reason !== "token") return false;
+  return heldTitleText(snapshot);
+}
+
+function heldTitleText(snapshot: string | null): boolean {
+  return installDisk({ base: holds.base("book.yaml"), snapshot, buffer: serializeTitle(bookTitle.value) }) === "hold";
+}
+
+function sectionSnapshot(): string | null {
+  const current = selected();
+  if (!current) return null;
+  return serializeSection(headerFromForm(current.node), shownBody(current.node));
 }
 
 function shownBody(node: TreeNode): string {
@@ -1592,24 +2068,16 @@ function restoreMine(
 async function snapshotFiles(current: Book): Promise<Map<string, HeldFile>> {
   const files = new Map<string, HeldFile>();
   const titlePath = joinPath(current.root, "book.yaml");
-  const title = await readMaybe(titlePath);
+  const title = await readOrNull(fs, titlePath);
   if (title !== null) files.set("book.yaml", { path: titlePath, bytes: title });
   const nodes: TreeNode[] = [];
   walk(current.nodes, (node) => nodes.push(node));
   for (const node of nodes) {
     const path = filePath(node);
-    const bytes = await readMaybe(path);
+    const bytes = await readOrNull(fs, path);
     if (bytes !== null) files.set(node.header.id, { path, bytes });
   }
   return files;
-}
-
-async function readMaybe(path: string): Promise<string | null> {
-  try {
-    return await fs.readText(path);
-  } catch {
-    return null;
-  }
 }
 
 function watchCompanion(): void {
@@ -1621,25 +2089,64 @@ function watchCompanion(): void {
 }
 
 async function pollCompanion(): Promise<void> {
-  if (!book) return;
-  let token: string | null;
+  if (pollIdle()) return;
+  await takeToken();
+}
+
+function pollIdle(): boolean {
+  return book == null || companionBusy;
+}
+
+async function takeToken(): Promise<void> {
+  const read = await readToken();
+  if (!read.ok) return;
+  await applyToken(read.token);
+}
+
+async function readToken(): Promise<{ ok: true; token: string | null } | { ok: false }> {
   try {
-    token = await readRefresh();
+    return { ok: true, token: await readRefresh() };
   } catch (error) {
     showWarnings([String(error)]);
-    return;
+    return { ok: false };
   }
+}
+
+async function applyToken(token: string | null): Promise<void> {
   if (!hasNewRefresh(appliedToken, token)) return;
+  await runToken(token);
+}
+
+async function runToken(token: string | null): Promise<void> {
+  companionBusy = true;
   navigating = true;
   try {
-    await applyFromDisk("token");
-    appliedToken = token;
-  } catch (error) {
-    showWarnings([`The book could not be read. ${String(error)}`]);
+    await holdForToken(token);
   } finally {
+    companionBusy = false;
     navigating = false;
   }
   publishPlace();
+}
+
+async function holdForToken(token: string | null): Promise<void> {
+  try {
+    await finishToken(token);
+  } catch (error) {
+    showWarnings([`The book could not be read. ${String(error)}`]);
+  }
+}
+
+async function finishToken(token: string | null): Promise<void> {
+  await joinedFlight();
+  await applyFromDisk("token");
+  appliedToken = token;
+}
+
+async function joinedFlight(): Promise<void> {
+  const flight = saveFlight;
+  if (!flight) return;
+  await flight;
 }
 
 function publishPlace(): void {
@@ -1678,76 +2185,6 @@ function publishPlace(): void {
   );
 }
 
-function paintConflict(conflict: boolean): void {
-  conflictStatus.hidden = !conflict;
-  keepMineButton.hidden = !conflict;
-  takeTheirsButton.hidden = !conflict;
-  conflictStatus.textContent = conflict ? "The companion changed this file." : "";
-}
-
-async function keepOpenFile(): Promise<void> {
-  if (!book) return;
-  if (holds.conflict("book.yaml")) await overwriteHeldTitle(fs, holds, book, bookTitle.value);
-  const current = selected();
-  const node = current?.node ?? preserved;
-  if (node && holds.conflict(node.header.id)) {
-    await overwriteHeldNode(fs, holds, node, headerFromForm(node), shownBody(node));
-    preserved = null;
-    await applyFromDisk("token");
-  }
-  dirty = false;
-  markSaved();
-  paintConflict(holds.anyConflict());
-  showCurrent();
-  publishPlace();
-}
-
-async function takeCompanionFile(): Promise<void> {
-  if (!book) return;
-  if (holds.conflict("book.yaml")) {
-    const taken = holds.takeTheirs("book.yaml");
-    if (taken.bytes != null) {
-      book.title = parseTitle(taken.bytes);
-      bookTitle.value = book.title;
-      document.title = titled(book.title);
-    }
-  }
-  const current = selected();
-  const id = current?.node.header.id ?? preserved?.header.id;
-  if (id && holds.conflict(id)) {
-    const taken = holds.takeTheirs(id);
-    preserved = null;
-    if (taken.bytes == null) {
-      selectedId = BOOK_ID;
-      editingProse = false;
-      loadDocument("", true);
-    } else {
-      const parsed = parseSection(taken.bytes);
-      const found = findNode(book.nodes, id);
-      if (found) {
-        found.node.header = parsed.header;
-        found.node.body = parsed.body;
-        selectedId = id;
-        if (editing()) loadDocument(parsed.body, false);
-      } else {
-        selectedId = BOOK_ID;
-        loadDocument("", true);
-      }
-    }
-  }
-  dirty = false;
-  markSaved();
-  paintConflict(holds.anyConflict());
-  showCurrent();
-  publishPlace();
-}
-
-function resumeSave(): void {
-  if (!dirty) return;
-  saveState.textContent = "Unsaved";
-  saveTimer = window.setTimeout(() => void flush(), 400);
-}
-
 function bookParent(): string | undefined {
   return book ? parentPath(book.root) : undefined;
 }
@@ -1758,10 +2195,35 @@ async function exportManuscript(): Promise<void> {
 }
 
 async function flushedBook(): Promise<Book> {
+  const captured = captureReload();
   await flush();
+  return restoredBook(captured);
+}
+
+async function restoredBook(captured: ReloadCapture): Promise<Book> {
   const loaded = await loadBook(fs, book!.root);
   book = loaded;
-  return loaded;
+  restoreFlushed(captured.kept);
+  restoreFlushedTitle(captured.keptTitle);
+  return book!;
+}
+
+function restoreFlushed(kept: OpenCapture | null): void {
+  if (!stillDirty(kept)) return;
+  restoreCaptured(kept!);
+}
+
+function stillDirty(kept: OpenCapture | null): boolean {
+  return dirty && kept != null;
+}
+
+function restoreFlushedTitle(keptTitle: string | null): void {
+  if (!titleStillDirty(keptTitle)) return;
+  book!.title = keptTitle!;
+}
+
+function titleStillDirty(keptTitle: string | null): boolean {
+  return titleDirty && keptTitle !== null;
 }
 
 async function writeFileExport(
@@ -2187,14 +2649,9 @@ async function writeBookTitle(title: string): Promise<void> {
   if (!book) return;
   bookTitle.value = title;
   holds.markEditing("book.yaml");
-  const result = await saveHeldTitle(fs, holds, book, title);
-  if (result === "conflict") {
-    paintConflict(true);
-    return;
-  }
-  document.title = title || "Bookwriter";
+  titleDirty = true;
+  await flush();
   renderOutline();
-  paintConflict(holds.anyConflict());
   publishPlace();
 }
 
@@ -2218,19 +2675,28 @@ async function renameOpen(title: string): Promise<void> {
 }
 
 async function renameClosed(node: TreeNode, title: string): Promise<void> {
-  const previous = { header: { ...node.header }, body: node.body };
-  const path = filePath(node);
-  const disk = await readMaybe(path);
-  if (disk !== null) holds.ensureTracked(node.header.id, { path, bytes: disk });
-  const source = closedSource(node, disk);
-  const result = await saveHeldNode(fs, holds, node, { ...source.header, title }, source.body);
-  if (result === "conflict") {
-    node.header = previous.header;
-    node.body = previous.body;
-    paintConflict(true);
-    return;
-  }
+  const result = await writeClosed(node, title);
+  trackClosed(node, result);
   showCurrent();
+}
+
+async function writeClosed(node: TreeNode, title: string): Promise<HeldSave> {
+  const path = filePath(node);
+  const disk = await readOrNull(fs, path);
+  trackDisk(node, path, disk);
+  const source = closedSource(node, disk);
+  return saveHeldNode(fs, holds, node, { ...source.header, title }, source.body);
+}
+
+function trackDisk(node: TreeNode, path: string, disk: string | null): void {
+  if (disk === null) return;
+  holds.ensureTracked(node.header.id, { path, bytes: disk });
+}
+
+function trackClosed(node: TreeNode, result: HeldSave): void {
+  if (result !== "hold") return;
+  parked.add(node.header.id);
+  saveState.textContent = "Unsaved";
 }
 
 function closedSource(node: TreeNode, disk: string | null): { header: Header; body: string } {
@@ -2397,8 +2863,22 @@ async function clearTrash(): Promise<void> {
 }
 
 async function keepOpenEdits(): Promise<void> {
-  if (openInsideTrash()) cancelSave();
-  else await flush();
+  if (openInsideTrash()) {
+    dropTrashEdits();
+    return;
+  }
+  await flush();
+}
+
+function dropTrashEdits(): void {
+  dirty = false;
+  unparkOpen();
+}
+
+function unparkOpen(): void {
+  const id = selectedNodeId();
+  if (!id) return;
+  parked.delete(id);
 }
 
 function releaseDeletedProse(next: string | null): void {
@@ -2476,7 +2956,7 @@ function firstManuscriptId(): string | null {
   return nodeId(manuscriptNodes(book!.nodes)[0]);
 }
 
-function nodeId(node: TreeNode | undefined): string | null {
+function nodeId(node: TreeNode | null | undefined): string | null {
   if (!node) return null;
   return node.header.id;
 }
@@ -3354,6 +3834,8 @@ for (const field of [fieldTitle, fieldSynopsis, fieldStatus, fieldRole, ...unitI
   field.addEventListener("input", () => {
     const current = selected();
     if (current) holds.markEditing(current.node.header.id);
+    dirty = true;
+    saveState.textContent = "Unsaved";
   });
   field.addEventListener("change", () => {
     const current = selected();
@@ -3378,6 +3860,8 @@ for (const field of [fieldTitle, fieldSynopsis, fieldStatus, fieldRole, ...unitI
 bookTitle.addEventListener("input", () => {
   if (!book) return;
   holds.markEditing("book.yaml");
+  titleDirty = true;
+  saveState.textContent = "Unsaved";
   publishPlace();
 });
 bookTitle.addEventListener("focus", () => publishPlace());
@@ -3386,21 +3870,8 @@ bookTitle.addEventListener("click", () => publishPlace());
 bookTitle.addEventListener("select", () => publishPlace());
 bookTitle.addEventListener("change", () => {
   if (!book) return;
-  void saveHeldTitle(fs, holds, book, bookTitle.value).then((result) => {
-    if (result === "conflict") {
-      paintConflict(true);
-      return;
-    }
-    document.title = bookTitle.value || "Bookwriter";
-    renderOutline();
-    paintConflict(holds.anyConflict());
-  });
-});
-keepMineButton.addEventListener("click", () => {
-  void keepOpenFile();
-});
-takeTheirsButton.addEventListener("click", () => {
-  void takeCompanionFile();
+  titleDirty = true;
+  void flush().then(() => renderOutline());
 });
 void getCurrentWindow().onCloseRequested(async () => {
   await stopCompanion().catch(() => undefined);
