@@ -52,7 +52,7 @@ describe("the spec as the book", () => {
     expect(exported.markdown).toContain("## The Rule");
     expect(exported.markdown).toContain("class Foo");
     expect(exported.markdown).toContain("Living spec.");
-    expect(exported.markdown).toContain("A rendered editor that writes Markdown back out on save");
+    expect(exported.markdown).toContain("Typing in the reading view writes into the section under the caret");
     expect(exported.warnings.filter((warning) => warning.startsWith("Unclosed"))).toEqual([]);
 
     const reading = renderGroup(book.nodes[0]);

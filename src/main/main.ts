@@ -37,7 +37,16 @@ import { blockAtLine, lineOffset, offsetFraction, scrollToSpot, sourceOffset } f
 import { divisionLabel, divisions, effectiveUnit, filePath, findNode, nodeWordCount, parseSection, serializeSection, serializeTitle, slugify, UNITS, walk, type Division, type Header, type Status, type TreeNode, type Unit } from "../internals/model";
 import { joinPath, parentPath } from "../internals/path";
 import { PICTURE_EXTENSIONS, placePicture, resolvePictureSources } from "../internals/pictures";
-import { renderBook, renderGroup, renderSection } from "../ui/preview";
+import { renderBook, renderGroup, renderSection, textRuns } from "../ui/preview";
+import {
+  applyRenderedInput,
+  caretLocal,
+  inBlock,
+  renderedInput,
+  type RenderedInput,
+  type SourceChange,
+  type TextEdit,
+} from "../ui/renderedEdit";
 import { previewClick } from "../ui/view";
 import { clampPreviewWidth, previewWidthFromPointer } from "../ui/split";
 import { allowBook, clearPlace, ensureCompanion, pandocDocx, readRefresh, setOpenBook, startupBookPath, stopCompanion, tauriFs, writePlace } from "../ui/tauriFs";
@@ -106,13 +115,11 @@ type Visit = { id: string; prose: boolean; state: EditorState | null };
 type Selection = { node: TreeNode; ancestors: TreeNode[] };
 type VisitMove = { trail: Trail<Visit>; to: Visit };
 type ContextAction = { label: string; run: () => Promise<void> };
-type CaretPoint = { offsetNode: Node; offset: number };
-
-type CaretDoc = Document & {
-  caretRangeFromPoint?: (px: number, py: number) => Range | null;
-  caretPositionFromPoint?: (px: number, py: number) => CaretPoint | null;
-};
 let trail = emptyTrail<Visit>();
+/** The rendered pane the caret should return to after a redraw. */
+let renderedFocus: HTMLElement | null = null;
+/** Section whose body is in the hidden editor while the reading view is up. */
+let renderedOwner: string | null = null;
 
 function inMarkup(command: Command): Command {
   return (view) => editing() && command(view);
@@ -204,6 +211,7 @@ const editorExtensions = [
     saveState.textContent = "Unsaved";
     drawPreview();
     paintWordCount();
+    syncRenderedView();
   }),
 ];
 
@@ -605,7 +613,12 @@ async function stepHistory(kind: "undo" | "redo"): Promise<void> {
 }
 
 function localDepth(kind: "undo" | "redo"): number {
-  return editing() ? editorDepth(kind) : 0;
+  if (!historyOwnsEditor()) return 0;
+  return editorDepth(kind);
+}
+
+function historyOwnsEditor(): boolean {
+  return editing() || renderedOwner != null;
 }
 
 function editorDepth(kind: "undo" | "redo"): number {
@@ -762,12 +775,20 @@ function paintViewToggle(): void {
 }
 
 function placeCursor(offset: number): void {
-  const pos = Math.max(0, Math.min(offset, editor.state.doc.length));
+  setEditorCursor(offset);
+  editor.focus();
+}
+
+function setEditorCursor(offset: number): void {
+  const pos = clampedPos(offset);
   editor.dispatch({
     selection: { anchor: pos, head: pos },
     scrollIntoView: true,
   });
-  editor.focus();
+}
+
+function clampedPos(offset: number): number {
+  return Math.max(0, Math.min(offset, editor.state.doc.length));
 }
 
 function elementAt(target: EventTarget | null): Element | null {
@@ -780,164 +801,10 @@ function parentElementOf(target: EventTarget | null): Element | null {
   return null;
 }
 
-function fractionAt(block: HTMLElement, x: number, y: number): number {
-  const placed = caretFraction(block, x, y);
-  if (placed != null) return placed;
-  return verticalFraction(block, y);
-}
-
-function caretFraction(block: HTMLElement, x: number, y: number): number | null {
-  const doc = block.ownerDocument as CaretDoc;
-  const total = textLength(block);
-  const range = rangeFromPoint(doc, x, y);
-  const point = caretPoint(doc, range, x, y);
-  const node = caretNode(range, point);
-  const nodeOffset = caretOffset(range, point);
-  if (!caretInside(block, node, nodeOffset, total)) return null;
-  return probeFraction(doc, block, node, nodeOffset as number, total);
-}
-
 function textLength(block: HTMLElement): number {
   const text = block.textContent;
   if (text == null) return 0;
   return text.length;
-}
-
-function rangeFromPoint(doc: CaretDoc, x: number, y: number): Range | null {
-  const fromPoint = doc.caretRangeFromPoint;
-  if (!fromPoint) return null;
-  return fromPoint.call(doc, x, y);
-}
-
-function caretNode(range: Range | null, point: CaretPoint | null | undefined): Node | undefined {
-  return range ? range.startContainer : offsetNode(point);
-}
-
-function offsetNode(point: CaretPoint | null | undefined): Node | undefined {
-  return point?.offsetNode;
-}
-
-function caretOffset(range: Range | null, point: CaretPoint | null | undefined): number | undefined {
-  return range ? range.startOffset : pointOffset(point);
-}
-
-function pointOffset(point: CaretPoint | null | undefined): number | undefined {
-  return point?.offset;
-}
-
-function caretPoint(doc: CaretDoc, range: Range | null, x: number, y: number): CaretPoint | null | undefined {
-  return range ? null : positionFromPoint(doc, x, y);
-}
-
-function positionFromPoint(doc: CaretDoc, x: number, y: number): CaretPoint | null | undefined {
-  const fromPoint = doc.caretPositionFromPoint;
-  if (!fromPoint) return null;
-  return fromPoint.call(doc, x, y);
-}
-
-function caretInside(block: HTMLElement, node: Node | undefined, nodeOffset: number | undefined, total: number): node is Node {
-  return node != null && offsetInBlock(block, node, nodeOffset, total);
-}
-
-function offsetInBlock(block: HTMLElement, node: Node, nodeOffset: number | undefined, total: number): boolean {
-  return nodeOffset != null && containsWithText(block, node, total);
-}
-
-function containsWithText(block: HTMLElement, node: Node, total: number): boolean {
-  return block.contains(node) && total > 0;
-}
-
-function probeFraction(doc: CaretDoc, block: HTMLElement, node: Node, nodeOffset: number, total: number): number | null {
-  try {
-    return measuredFraction(doc, block, node, nodeOffset, total);
-  } catch {
-    // The caret sits outside this block. Use the vertical fraction below.
-    return null;
-  }
-}
-
-function measuredFraction(doc: CaretDoc, block: HTMLElement, node: Node, nodeOffset: number, total: number): number {
-  const probe = doc.createRange();
-  probe.setStart(block, 0);
-  probe.setEnd(node, nodeOffset);
-  return Math.min(1, Math.max(0, probe.toString().length / total));
-}
-
-function verticalFraction(block: HTMLElement, y: number): number {
-  const rect = block.getBoundingClientRect();
-  if (rect.height <= 0) return 0;
-  return Math.min(1, Math.max(0, (y - rect.top) / rect.height));
-}
-
-function nearestBlock(root: HTMLElement, y: number): HTMLElement | null {
-  let best: HTMLElement | null = null;
-  let bestDist = Infinity;
-  for (const block of root.querySelectorAll<HTMLElement>("[data-line]")) {
-    const closer = closerBlock(block, y, best, bestDist);
-    best = closer[0];
-    bestDist = closer[1];
-  }
-  return best;
-}
-
-function closerBlock(block: HTMLElement, y: number, best: HTMLElement | null, bestDist: number): [HTMLElement | null, number] {
-  const dist = blockDistance(block, y);
-  if (dist < bestDist) return [block, dist];
-  return [best, bestDist];
-}
-
-function blockDistance(block: HTMLElement, y: number): number {
-  const rect = block.getBoundingClientRect();
-  if (y < rect.top) return rect.top - y;
-  return belowDistance(rect, y);
-}
-
-function belowDistance(rect: DOMRect, y: number): number {
-  return y > rect.bottom ? y - rect.bottom : 0;
-}
-
-/** Approximate source offset for a click in rendered markup. */
-function clickOffset(root: HTMLElement, event: MouseEvent, source: string): number {
-  const element = elementAt(event.target);
-  if (!insideRoot(root, element)) return 0;
-  return offsetInRoot(root, element, event, source);
-}
-
-function insideRoot(root: HTMLElement, element: Element | null): element is Element {
-  return element != null && root.contains(element);
-}
-
-function offsetInRoot(root: HTMLElement, element: Element, event: MouseEvent, source: string): number {
-  const direct = element.closest<HTMLElement>("[data-line]");
-  if (ownedBlock(root, direct)) return offsetOfBlock(direct, event, source);
-  return offsetFromHeading(root, element, event, source);
-}
-
-function ownedBlock(root: HTMLElement, block: HTMLElement | null): block is HTMLElement {
-  return block != null && root.contains(block);
-}
-
-function offsetFromHeading(root: HTMLElement, element: Element, event: MouseEvent, source: string): number {
-  const heading = element.closest("h1, h2, h3, h4, h5, h6");
-  if (ownedHeading(root, heading)) return 0;
-  return offsetFromNearest(root, event, source);
-}
-
-function ownedHeading(root: HTMLElement, heading: Element | null): boolean {
-  return heading != null && root.contains(heading);
-}
-
-function offsetFromNearest(root: HTMLElement, event: MouseEvent, source: string): number {
-  const block = nearestBlock(root, event.clientY);
-  if (!block) return 0;
-  return offsetOfBlock(block, event, source);
-}
-
-function offsetOfBlock(block: HTMLElement, event: MouseEvent, source: string): number {
-  const start = Number(block.dataset.line);
-  const end = spanEnd(block, start);
-  if (!integerSpan(start, end)) return 0;
-  return sourceOffset(source, start, end, fractionAt(block, event.clientX, event.clientY));
 }
 
 function spanEnd(block: HTMLElement, start: number): number {
@@ -1174,7 +1041,7 @@ function paintWholeBook(): void {
   editorHost.hidden = true;
   readingEl.hidden = false;
   const rendered = renderBook(manuscriptNodes(book!.nodes));
-  readingEl.innerHTML = showPictures(rendered.html);
+  paintReadingHtml(showPictures(rendered.html));
   showWarnings([...bookWarnings(), ...rendered.warnings]);
 }
 
@@ -1203,8 +1070,32 @@ function paintGroupReading(current: Selection): void {
   editorHost.hidden = true;
   readingEl.hidden = false;
   const rendered = renderGroup(current.node, current.ancestors, groupDivisions());
-  readingEl.innerHTML = showPictures(rendered.html);
+  paintReadingHtml(showPictures(rendered.html));
   showWarnings([...bookWarnings(), ...rendered.warnings]);
+}
+
+let readingStamp = "";
+
+function paintReadingHtml(html: string): void {
+  const scroll = keptReadingScroll();
+  readingStamp = readingViewStamp();
+  readingEl.innerHTML = html;
+  readingEl.scrollTop = scroll;
+}
+
+function keptReadingScroll(): number {
+  if (readingStamp !== readingViewStamp()) return 0;
+  return readingEl.scrollTop;
+}
+
+function readingViewStamp(): string {
+  if (viewingBook()) return BOOK_ID;
+  return selectedOrEmpty();
+}
+
+function selectedOrEmpty(): string {
+  if (selectedId) return selectedId;
+  return "";
 }
 
 function groupDivisions(): Map<string, Division> | undefined {
@@ -1546,6 +1437,7 @@ async function switchSelection(id: string, prose: boolean): Promise<void> {
 }
 
 async function commitLeaving(id: string, prose: boolean): Promise<void> {
+  releaseReadingBuffer();
   rememberOpen();
   await flushTwice();
   parkLeaving();
@@ -1667,14 +1559,9 @@ function captureOpen(): OpenCapture | null {
 }
 
 function restoreCaptured(kept: OpenCapture): void {
-  const found = findCaptured(kept.id);
+  const found = rowNode(kept.id);
   if (!found) return;
   placeCaptured(found.node, kept);
-}
-
-function findCaptured(id: string): { node: TreeNode } | null {
-  if (!book) return null;
-  return findNode(book.nodes, id);
 }
 
 function placeCaptured(node: TreeNode, kept: OpenCapture): void {
@@ -2305,7 +2192,11 @@ async function saveChapterPdf(id: string): Promise<void> {
 }
 
 function missingChapter(): void {
-  showWarnings(["That chapter is not in the book."]);
+  failExport("That chapter is not in the book.");
+}
+
+function failExport(message: string): void {
+  showWarnings([message]);
   saveState.textContent = "Export failed";
 }
 
@@ -2367,8 +2258,7 @@ async function writePresentDocx(directory: string, result: ReturnType<typeof exp
 }
 
 function emptyDocxExport(): void {
-  showWarnings(["There are no chapters or front matter to export."]);
-  saveState.textContent = "Export failed";
+  failExport("There are no chapters or front matter to export.");
 }
 
 async function finishDocxExport(directory: string, result: ReturnType<typeof exportDocxFiles>): Promise<void> {
@@ -3790,38 +3680,492 @@ function overflowScrolls(element: HTMLElement): boolean {
   return overflow === "auto" || overflow === "scroll";
 }
 
+previewEl.addEventListener("beforeinput", onRenderedInput);
+readingEl.addEventListener("beforeinput", onRenderedInput);
+previewEl.addEventListener("keydown", onRenderedKeyDown);
+readingEl.addEventListener("keydown", onRenderedKeyDown);
+editor.dom.addEventListener("focusin", () => {
+  renderedFocus = null;
+});
 previewEl.addEventListener("click", (event) => {
-  if (!editing()) return;
   if (followFootnote(previewEl, event)) return;
-  event.preventDefault();
-  placeCursor(clickOffset(previewEl, event, editor.state.doc.toString()));
+  keepLink(event);
+  focusRendered(previewEl);
+  syncPreviewCaret();
 });
 readingEl.addEventListener("click", (event) => {
-  if (!book) return;
   if (followFootnote(readingEl, event)) return;
-  const element = elementAt(event.target);
-  const section = element?.closest<HTMLElement>("section[data-id]");
-  if (!section || !readingEl.contains(section)) return;
-  const id = section.dataset.id;
-  if (!id) return;
-  const found = findNode(book.nodes, id);
-  if (!found) return;
-  event.preventDefault();
-  const offset = clickOffset(section, event, found.node.body);
-  void openAt(id, found.node.kind === "group", offset);
+  keepLink(event);
+  focusRendered(readingEl);
 });
 
-async function openAt(id: string, prose: boolean, offset: number): Promise<void> {
-  if (needsChoose(id, prose)) await choose(id, prose);
-  placeCursor(offset);
+function focusRendered(root: HTMLElement): void {
+  renderedFocus = root;
 }
 
-function needsChoose(id: string, prose: boolean): boolean {
-  return selectedId !== id || proseDiffers(prose);
+function keepLink(event: MouseEvent): void {
+  if (!linked(elementAt(event.target))) return;
+  event.preventDefault();
 }
 
-function proseDiffers(prose: boolean): boolean {
-  return prose !== editingProse || !editing();
+function linked(element: Element | null): boolean {
+  if (!element) return false;
+  return element.closest("a") != null;
+}
+
+function syncPreviewCaret(): void {
+  if (!editing()) return;
+  movePreviewCaret();
+}
+
+function movePreviewCaret(): void {
+  const caret = readCaret(previewEl);
+  if (!caret) return;
+  setEditorCursor(caret.head);
+}
+
+function onRenderedKeyDown(event: KeyboardEvent): void {
+  if (skipBreak(event)) return;
+  event.preventDefault();
+  insertBreak(event);
+}
+
+function skipBreak(event: KeyboardEvent): boolean {
+  return event.key !== "Enter" || event.isComposing;
+}
+
+function insertBreak(event: KeyboardEvent): void {
+  const root = renderedEventRoot(event.currentTarget);
+  if (!root) return;
+  insertIn(root, event.shiftKey);
+}
+
+function insertIn(root: HTMLElement, shift: boolean): void {
+  const caret = readCaret(root);
+  if (!caret) return;
+  insertAt(root, caret, shift);
+}
+
+function insertAt(root: HTMLElement, caret: SourceCaret, shift: boolean): void {
+  editNode(root, caret, { kind: "insert", text: breakText(caret, shift) }, "insertParagraph");
+}
+
+function breakText(caret: SourceCaret, shift: boolean): string {
+  if (shift) return "\n";
+  return breakFor(caret);
+}
+
+function onRenderedInput(event: InputEvent): void {
+  const root = renderedEventRoot(event.currentTarget);
+  if (!root) return;
+  event.preventDefault();
+  applyRendered(root, event);
+}
+
+function renderedEventRoot(target: EventTarget | null): HTMLElement | null {
+  if (target === readingEl) return readingEl;
+  return previewTarget(target);
+}
+
+function previewTarget(target: EventTarget | null): HTMLElement | null {
+  if (target === previewEl) return previewEl;
+  return null;
+}
+
+function applyRendered(root: HTMLElement, event: InputEvent): void {
+  if (isBreakInput(event.inputType)) return;
+  applyCaret(root, event);
+}
+
+function applyCaret(root: HTMLElement, event: InputEvent): void {
+  const caret = readCaret(root);
+  if (!caret) return;
+  runCaret(root, caret, event);
+}
+
+function isBreakInput(type: string): boolean {
+  return type === "insertParagraph" || type === "insertLineBreak";
+}
+
+function runCaret(root: HTMLElement, caret: SourceCaret, event: InputEvent): void {
+  const input = renderedInput(event.inputType, inputText(event), breakFor(caret));
+  if (!input) return;
+  runRendered(root, caret, input, event.inputType);
+}
+
+function inputText(event: InputEvent): string | null {
+  if (event.data != null) return event.data;
+  return transferText(event.dataTransfer);
+}
+
+function transferText(transfer: DataTransfer | null): string | null {
+  if (!transfer) return null;
+  return transfer.getData("text/plain");
+}
+
+function breakFor(caret: SourceCaret): string {
+  const node = nodeOf(caret.node);
+  if (!node) return "\n\n";
+  return paragraphBreak(renderedBody(node), caret.head, caret.anchor === caret.head);
+}
+
+function paragraphBreak(body: string, head: number, collapsed: boolean): string {
+  if (breakLine(body, head, collapsed)) return "\n";
+  return "\n\n";
+}
+
+function breakLine(body: string, head: number, collapsed: boolean): boolean {
+  return collapsed && inBlock(textRuns(body), head);
+}
+
+function renderedBody(node: TreeNode): string {
+  if (editorOwns(node)) return editor.state.doc.toString();
+  return node.body;
+}
+
+function editorOwns(node: TreeNode): boolean {
+  return editing() && selectedId === node.header.id;
+}
+
+function runRendered(root: HTMLElement, caret: SourceCaret, input: RenderedInput, type: string): void {
+  if (isHistory(input)) requestHistory(input.kind);
+  else editNode(root, caret, input, type);
+}
+
+function isHistory(input: RenderedInput): input is { kind: "undo" } | { kind: "redo" } {
+  return input.kind === "undo" || input.kind === "redo";
+}
+
+function editNode(root: HTMLElement, caret: SourceCaret, input: TextEdit, type: string): void {
+  const node = nodeOf(caret.node);
+  if (!node) return;
+  commitRendered(root, node, caret, input, type);
+}
+
+function nodeOf(node: Node): TreeNode | null {
+  const section = sectionOf(node);
+  if (!section) return null;
+  return nodeById(section.dataset.id);
+}
+
+function sectionOf(node: Node | null): HTMLElement | null {
+  const element = elementNode(node);
+  if (!element) return null;
+  return element.closest<HTMLElement>("section[data-id]");
+}
+
+function elementNode(node: Node | null): Element | null {
+  if (node instanceof Element) return node;
+  return parentOf(node);
+}
+
+function parentOf(node: Node | null): Element | null {
+  if (node instanceof Text) return parentElementOf(node);
+  return null;
+}
+
+function nodeById(id: string | undefined): TreeNode | null {
+  const found = findById(id);
+  if (!found) return null;
+  return found.node;
+}
+
+function findById(id: string | undefined): { node: TreeNode } | null {
+  if (!hasBookId(id)) return null;
+  return findNode(book!.nodes, id);
+}
+
+function hasBookId(id: string | undefined): id is string {
+  return id != null && book != null;
+}
+
+function commitRendered(root: HTMLElement, node: TreeNode, caret: SourceCaret, input: TextEdit, type: string): void {
+  const body = renderedBody(node);
+  copyCut(body, caret, type);
+  writeChange(root, node, applyRenderedInput(body, caret.anchor, caret.head, input));
+}
+
+function copyCut(body: string, caret: SourceCaret, type: string): void {
+  if (type !== "deleteByCut") return;
+  void writeText(cutText(body, caret));
+}
+
+function cutText(body: string, caret: SourceCaret): string {
+  const from = Math.min(caret.anchor, caret.head);
+  const to = Math.max(caret.anchor, caret.head);
+  return body.slice(from, to);
+}
+
+function writeChange(root: HTMLElement, node: TreeNode, next: SourceChange): void {
+  if (next.body === renderedBody(node)) return;
+  renderedFocus = root;
+  dispatchChange(node, next);
+}
+
+function dispatchChange(node: TreeNode, next: SourceChange): void {
+  if (editorOwns(node)) dispatchRendered(next);
+  else dispatchReading(node, next);
+}
+
+function dispatchRendered(next: SourceChange): void {
+  editor.dispatch({
+    changes: { from: next.from, to: next.to, insert: next.insert },
+    selection: { anchor: next.caret, head: next.caret },
+  });
+}
+
+function dispatchReading(node: TreeNode, next: SourceChange): void {
+  holdReading(node);
+  dispatchRendered(next);
+}
+
+function holdReading(node: TreeNode): void {
+  if (renderedOwner === node.header.id) return;
+  switchReading(node);
+}
+
+function switchReading(node: TreeNode): void {
+  releaseReadingBuffer();
+  openReadingBuffer(node);
+}
+
+function openReadingBuffer(node: TreeNode): void {
+  renderedOwner = node.header.id;
+  loadDocument(node.body, true);
+}
+
+function releaseReadingBuffer(): void {
+  const id = renderedOwner;
+  if (!id) return;
+  parkReading(id);
+}
+
+function parkReading(id: string): void {
+  renderedOwner = null;
+  const node = parkedReading(id);
+  if (!node) return;
+  storeParkedBody(node, id);
+}
+
+function parkedReading(id: string): TreeNode | null {
+  const found = rowNode(id);
+  if (!found) return null;
+  return found.node;
+}
+
+function storeParkedBody(node: TreeNode, id: string): void {
+  node.body = editor.state.doc.toString();
+  parked.add(id);
+}
+
+function syncRenderedView(): void {
+  if (renderedOwner) syncReadingBuffer();
+  else placePreviewCaret();
+}
+
+function placePreviewCaret(): void {
+  if (skipPreviewCaret()) return;
+  placeRenderedCaret(previewEl, editor.state.selection.main.head);
+}
+
+function skipPreviewCaret(): boolean {
+  if (renderedFocus !== previewEl) return true;
+  return previewHidden();
+}
+
+function previewHidden(): boolean {
+  return previewEl.hidden !== false;
+}
+
+function syncReadingBuffer(): void {
+  const node = ownedReading();
+  if (!node) return;
+  writeReadingNode(node);
+}
+
+function ownedReading(): TreeNode | null {
+  const found = findOwned();
+  if (!found) return null;
+  return found.node;
+}
+
+function findOwned(): { node: TreeNode } | null {
+  if (!readingOwnerId()) return null;
+  return findNode(book!.nodes, renderedOwner!);
+}
+
+function readingOwnerId(): boolean {
+  return book != null && renderedOwner != null;
+}
+
+function writeReadingNode(node: TreeNode): void {
+  node.body = editor.state.doc.toString();
+  parked.add(node.header.id);
+  holds.markEditing(node.header.id);
+  drawReading();
+  placeRenderedCaret(readingEl, editor.state.selection.main.head);
+  paintRowCount(node);
+}
+
+type SourceCaret = { anchor: number; head: number; node: Node };
+
+function placeRenderedCaret(root: HTMLElement, offset: number): void {
+  const spot = caretSpot(root, offset);
+  if (!spot) return;
+  selectSpot(root, spot);
+}
+
+function caretSpot(root: HTMLElement, offset: number): { node: Text; offset: number } | null {
+  const host = hostFor(root, offset);
+  if (!host) return null;
+  return textPoint(host.el, host.local);
+}
+
+function hostFor(root: HTMLElement, offset: number): { el: HTMLElement; local: number } | null {
+  const placed = caretLocal(domRuns(root), offset);
+  if (!placed) return null;
+  return hostAt(root, placed);
+}
+
+function hostAt(root: HTMLElement, placed: { src: number; local: number }): { el: HTMLElement; local: number } | null {
+  const el = root.querySelector<HTMLElement>(`[data-src="${placed.src}"]`);
+  if (!el) return null;
+  return { el, local: placed.local };
+}
+
+function domRuns(root: HTMLElement): Array<{ src: number; text: string }> {
+  return [...root.querySelectorAll<HTMLElement>("[data-src]")].map(domRun);
+}
+
+function domRun(el: HTMLElement): { src: number; text: string } {
+  return { src: Number(el.dataset.src), text: el.textContent ?? "" };
+}
+
+function textPoint(el: HTMLElement, local: number): { node: Text; offset: number } | null {
+  const walker = el.ownerDocument.createTreeWalker(el, NodeFilter.SHOW_TEXT);
+  return stepText(walker, local, 0);
+}
+
+function stepText(walker: TreeWalker, local: number, seen: number): { node: Text; offset: number } | null {
+  const node = walker.nextNode();
+  if (!(node instanceof Text)) return null;
+  return pointOrNext(walker, node, local, seen);
+}
+
+function pointOrNext(
+  walker: TreeWalker,
+  node: Text,
+  local: number,
+  seen: number,
+): { node: Text; offset: number } | null {
+  const next = seen + node.length;
+  if (local <= next) return { node, offset: local - seen };
+  return stepText(walker, local, next);
+}
+
+function selectSpot(root: HTMLElement, spot: { node: Text; offset: number }): void {
+  const range = root.ownerDocument.createRange();
+  range.setStart(spot.node, spot.offset);
+  range.collapse(true);
+  const selection = root.ownerDocument.getSelection();
+  if (!selection) return;
+  applySpot(root, selection, range, spot.node);
+}
+
+function applySpot(root: HTMLElement, selection: globalThis.Selection, range: Range, node: Text): void {
+  selection.removeAllRanges();
+  selection.addRange(range);
+  root.focus();
+  reveal(node.parentElement);
+}
+
+function reveal(element: HTMLElement | null): void {
+  if (!element) return;
+  element.scrollIntoView({ block: "nearest" });
+}
+
+function readCaret(root: HTMLElement): SourceCaret | null {
+  const selection = root.ownerDocument.getSelection();
+  if (!selection) return null;
+  return caretFrom(root, selection);
+}
+
+function caretFrom(root: HTMLElement, selection: globalThis.Selection): SourceCaret | null {
+  const anchor = sourceOf(root, selection.anchorNode, selection.anchorOffset);
+  if (anchor == null) return null;
+  return caretHead(root, selection, anchor);
+}
+
+function caretHead(root: HTMLElement, selection: globalThis.Selection, anchor: number): SourceCaret | null {
+  const head = sourceOf(root, selection.focusNode, selection.focusOffset);
+  if (head == null) return null;
+  return caretSame(selection, anchor, head);
+}
+
+function caretSame(selection: globalThis.Selection, anchor: number, head: number): SourceCaret | null {
+  const node = sharedSectionNode(selection);
+  if (!node) return null;
+  return { anchor, head, node };
+}
+
+function sharedSectionNode(selection: globalThis.Selection): Node | null {
+  if (!oneSection(selection.anchorNode, selection.focusNode)) return null;
+  return selection.anchorNode;
+}
+
+function oneSection(anchor: Node | null, head: Node | null): boolean {
+  const section = sectionOf(anchor);
+  if (!section) return false;
+  return section === sectionOf(head);
+}
+
+function sourceOf(root: HTMLElement, node: Node | null, offset: number): number | null {
+  const host = hostOf(root, node);
+  if (!host) return null;
+  return srcPlus(host, node, offset);
+}
+
+function hostOf(root: HTMLElement, node: Node | null): HTMLElement | null {
+  const element = elementNode(node);
+  if (!element) return null;
+  return closestSource(root, element);
+}
+
+function closestSource(root: HTMLElement, element: Element): HTMLElement | null {
+  const host = element.closest<HTMLElement>("[data-src]");
+  if (!inside(root, host)) return null;
+  return host;
+}
+
+function inside(root: HTMLElement, host: HTMLElement | null): host is HTMLElement {
+  return host != null && root.contains(host);
+}
+
+function srcPlus(host: HTMLElement, node: Node | null, offset: number): number | null {
+  const local = localOffset(host, node, offset);
+  if (local == null) return null;
+  return Number(host.dataset.src) + local;
+}
+
+function localOffset(host: HTMLElement, node: Node | null, offset: number): number | null {
+  if (!node) return null;
+  return countedOffset(host, node, offset);
+}
+
+function countedOffset(host: HTMLElement, node: Node, offset: number): number | null {
+  const walker = host.ownerDocument.createTreeWalker(host, NodeFilter.SHOW_TEXT);
+  return countTo(walker, node, offset, 0);
+}
+
+function countTo(walker: TreeWalker, target: Node, offset: number, seen: number): number | null {
+  const node = walker.nextNode();
+  if (!(node instanceof Text)) return null;
+  return countNode(walker, node, target, offset, seen);
+}
+
+function countNode(walker: TreeWalker, node: Text, target: Node, offset: number, seen: number): number | null {
+  if (node === target) return seen + offset;
+  return countTo(walker, target, offset, seen + node.length);
 }
 editProse.addEventListener("click", () => {
   if (selectedId) void choose(selectedId, true);

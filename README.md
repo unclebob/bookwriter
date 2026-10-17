@@ -40,8 +40,8 @@ Inside the window:
 
 - **File → Open Book** (⌘O) opens another folder. **Refresh** (⌘R) reads the book from disk again and shows it. It does not save the open buffer first. **Export Manuscript** (⌘⇧E) writes one Markdown file. **Export PDF** writes a PDF. The PDF prints the front matter's notes at the end of the front matter and each chapter's notes at the end of that chapter. **Export Chapters to Word** writes each front-matter piece as `FM-title.docx` and each chapter as `cc-title.docx` into one directory.
 - The outline is the book. Drag a row to reorder it, or drop it on a folder to nest it. Right-click a chapter and choose **Export to PDF** to write a PDF of that chapter and the sections inside it. The form under the outline edits the title, synopsis, status, role, and unit. The book title is the field at the top of the window.
-- A section opens in the Markdown editor. A folder opens as a reading view of that folder, in tree order.
-- **Markup** shows or hides the preview beside the editor. The preview follows the buffer, including unsaved text. Clicking in the Markdown scrolls the preview to that place.
+- A section opens in the Markdown editor. A folder opens as a reading view of that folder, in tree order. Typing in the reading view edits the section under the caret.
+- **Markup** shows or hides the preview beside the editor. The preview follows the buffer, including unsaved text. Typing in the preview edits that buffer. Clicking in the Markdown scrolls the preview to that place.
 - **Find** (⌘F) searches the open text. The find panel has a whole-book checkbox. Find Next is ⌘G.
 - **Command Palette** (⌘K) inserts emphasis, strong, inline code, a link, a picture, a heading, a list, a quotation, a code block, or a footnote. The Markup page lists the same commands.
 - A footnote marker in the preview scrolls to that note, and the return mark scrolls back. When the Markdown is on screen, the cursor moves to that same place.

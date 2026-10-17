@@ -287,7 +287,12 @@ body.pane-dragging { cursor: col-resize; user-select: none; }
 .reading, .preview {
   padding: 1.4rem 1.6rem 3rem;
   cursor: text;
+  caret-color: #241f1a;
+  outline: none;
 }
+
+.rendered-section pre,
+.rendered-section pre * { caret-color: #f4efe6; }
 
 .preview {
   background: #fbf8f2;
