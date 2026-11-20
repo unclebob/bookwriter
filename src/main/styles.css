@@ -122,6 +122,12 @@ body.pane-dragging { cursor: col-resize; user-select: none; }
   overflow: auto;
 }
 
+.stage {
+  display: flex;
+  flex-direction: column;
+  overflow: hidden;
+}
+
 .outline-column {
   border-right: 1px solid #ddd4c6;
   background: #ebe4d8;
@@ -257,7 +263,38 @@ body.pane-dragging { cursor: col-resize; user-select: none; }
 
 .stage { background: #fbf8f2; }
 
-.editor-host, .reading, .preview { height: 100%; }
+/* The editor theme is copied onto this node, including height: 100%. */
+#find-bar {
+  flex: none;
+  height: auto;
+  min-height: 0;
+  pointer-events: none;
+}
+#find-bar .cm-panels { pointer-events: auto; }
+.editor-host, .reading {
+  flex: 1 1 auto;
+  min-height: 0;
+  height: auto;
+  overflow: auto;
+}
+.preview { height: 100%; }
+
+#find-bar .cm-panels {
+  background: #efe8dc;
+  color: #241f1a;
+}
+#find-bar .cm-panels-top { border-bottom: 1px solid #ddd4c6; }
+#find-bar .cm-panel.cm-search input.cm-textfield {
+  background: #fbf8f2;
+  border: 1px solid #c9bfb2;
+  border-radius: 4px;
+  padding: 0.15rem 0.4rem;
+}
+
+::highlight(find-hit) {
+  background-color: #e8b86a;
+  color: #241f1a;
+}
 
 .editor-host .cm-editor { height: 100%; }
 .editor-host .cm-editor > .cm-scroller {

@@ -2,9 +2,9 @@ import "./styles.css";
 import { defaultKeymap, history, historyKeymap, redo, redoDepth, undo, undoDepth } from "@codemirror/commands";
 import { markdown } from "@codemirror/lang-markdown";
 import { languages } from "@codemirror/language-data";
-import { findNext, findPrevious, getSearchQuery, openSearchPanel, search, searchKeymap, setSearchQuery, type SearchQuery } from "@codemirror/search";
+import { closeSearchPanel, findNext, findPrevious, getSearchQuery, openSearchPanel, search, searchKeymap, setSearchQuery, type SearchQuery } from "@codemirror/search";
 import { EditorSelection, EditorState, Transaction } from "@codemirror/state";
-import { EditorView, keymap, type Command } from "@codemirror/view";
+import { EditorView, keymap, panels, type Command } from "@codemirror/view";
 import { convertFileSrc } from "@tauri-apps/api/core";
 import { getCurrentWindow } from "@tauri-apps/api/window";
 import { readText, writeText } from "@tauri-apps/plugin-clipboard-manager";
@@ -76,6 +76,7 @@ const fieldId = document.querySelector<HTMLElement>("#field-id")!;
 const editProse = document.querySelector<HTMLButtonElement>("#btn-edit-prose")!;
 const readGroup = document.querySelector<HTMLButtonElement>("#btn-read")!;
 const editorHost = document.querySelector<HTMLElement>("#editor-host")!;
+const findBar = document.querySelector<HTMLElement>("#find-bar")!;
 const readingEl = document.querySelector<HTMLElement>("#reading")!;
 const previewEl = document.querySelector<HTMLElement>("#preview")!;
 const paneSplit = document.querySelector<HTMLElement>("#pane-split")!;
@@ -125,8 +126,22 @@ function inMarkup(command: Command): Command {
   return (view) => editing() && command(view);
 }
 
+/** Escape closes Find on the reading view. Other search keys stay in the editor. */
+function searchBinding(command: Command): Command {
+  if (command === closeSearchPanel) return dismissFind;
+  return inMarkup(bookSearch(command));
+}
+
+function dismissFind(view: EditorView): boolean {
+  const closed = closeSearchPanel(view);
+  if (closed && !editing()) readingEl.focus();
+  return closed;
+}
+
 /** Survives a new editor state when Find Next opens another text. */
 let searchWholeBook = false;
+/** The last reading-view hit, so the next press moves on after the field takes focus. */
+let foundAt: FindHit | null = null;
 
 /** Find Next and Find Previous follow the whole-book checkbox. Other search commands stay as they are. */
 function bookSearch(command: Command): Command {
@@ -139,8 +154,12 @@ function runBookSearch(command: Command, view: EditorView): boolean {
 }
 
 function wholeBookStep(command: Command): boolean {
-  if (!searchWholeBook) return false;
+  if (!usesBookFind()) return false;
   return stepWholeBook(command);
+}
+
+function usesBookFind(): boolean {
+  return searchWholeBook || !editing();
 }
 
 function stepWholeBook(command: Command): boolean {
@@ -167,6 +186,7 @@ function finishBookSearch(command: Command, view: EditorView): boolean {
 const editorExtensions = [
   history(),
   search({ top: true }),
+  panels({ topContainer: findBar }),
   keymap.of([
     { key: "Mod-b", run: () => (runCommand("strong"), true) },
     { key: "Mod-i", run: () => (runCommand("emphasis"), true) },
@@ -177,8 +197,8 @@ const editorExtensions = [
     { linux: "Ctrl-Shift-z", run: () => requestHistory("redo"), preventDefault: true },
     ...searchKeymap.map((binding) => ({
       ...binding,
-      run: binding.run ? inMarkup(bookSearch(binding.run)) : undefined,
-      shift: binding.shift ? inMarkup(bookSearch(binding.shift)) : undefined,
+      run: binding.run ? searchBinding(binding.run) : undefined,
+      shift: binding.shift ? searchBinding(binding.shift) : undefined,
     })),
     ...historyKeymap,
     ...defaultKeymap,
@@ -194,9 +214,9 @@ const editorExtensions = [
   }),
   EditorView.updateListener.of((update) => {
     // Find Next and Find Previous mark the selection with this event. Select-all uses a longer name.
-    if (update.transactions.some((tr) => tr.annotation(Transaction.userEvent) === "select.search")) {
-      scrollPreviewToCursor();
-    }
+    const searched = update.transactions.some((tr) => tr.annotation(Transaction.userEvent) === "select.search");
+    if (searched) scrollPreviewToCursor();
+    if (update.selectionSet && !searched) clearFound();
     if (update.selectionSet && !suppress) publishPlace();
     if (!update.docChanged || suppress) return;
     const current = selected();
@@ -3152,29 +3172,26 @@ function pasteEditor(text: string): void {
 }
 
 function openFind(): void {
-  if (!editing()) return;
   openSearchPanel(editor);
   wireBookFind(editor);
 }
 
 function openReplace(): void {
-  if (!editing()) return;
   openSearchPanel(editor);
   wireBookFind(editor);
   focusReplaceField();
 }
 
 function focusReplaceField(): void {
-  editor.dom.querySelector<HTMLInputElement>(".cm-search input[name=replace]")?.focus();
+  searchPanel()?.querySelector<HTMLInputElement>("input[name=replace]")?.focus();
 }
 
 function goToMatch(direction: "next" | "previous"): void {
-  if (!editing()) return;
   stepMatch(direction);
 }
 
 function stepMatch(direction: "next" | "previous"): void {
-  if (searchWholeBook) void findInBook(direction);
+  if (usesBookFind()) void findInBook(direction);
   else stepLocalMatch(direction);
 }
 
@@ -3192,9 +3209,23 @@ function searchParts(): FindPart[] {
 function bookSearchParts(): FindPart[] {
   const current = selected();
   const parts: FindPart[] = [];
-  walk(manuscriptNodes(book!.nodes), (node) => parts.push(searchPart(node, current)));
+  walk(searchRoots(), (node) => parts.push(searchPart(node, current)));
   if (missingOpenPart(current, parts)) parts.push(openPart(current!));
   return parts;
+}
+
+function searchRoots(): TreeNode[] {
+  const folder = folderScope();
+  if (folder) return [folder];
+  return manuscriptNodes(book!.nodes);
+}
+
+/** A folder's reading view searches that folder until whole book is checked. */
+function folderScope(): TreeNode | null {
+  if (searchWholeBook || editing() || viewingBook()) return null;
+  const current = selected();
+  if (!current || current.node.kind !== "group") return null;
+  return current.node;
 }
 
 function searchPart(node: TreeNode, current: Selection | null): FindPart {
@@ -3202,12 +3233,17 @@ function searchPart(node: TreeNode, current: Selection | null): FindPart {
 }
 
 function searchPartText(node: TreeNode, current: Selection | null): string {
-  if (openBuffer(node, current)) return editor.state.doc.toString();
+  if (usesEditorBuffer(node, current)) return editor.state.doc.toString();
   return node.body;
 }
 
+function usesEditorBuffer(node: TreeNode, current: Selection | null): boolean {
+  if (renderedOwner === node.header.id) return true;
+  return openBuffer(node, current);
+}
+
 function openBuffer(node: TreeNode, current: Selection | null): boolean {
-  return current != null && node.header.id === current.node.header.id;
+  return editing() && current != null && node.header.id === current.node.header.id;
 }
 
 function missingOpenPart(current: Selection | null, parts: FindPart[]): boolean {
@@ -3232,12 +3268,16 @@ function selectMatch(from: number, to: number): void {
 }
 
 function focusSearch(): void {
-  editor.dom.querySelector<HTMLInputElement>(".cm-search [main-field]")?.focus();
+  searchPanel()?.querySelector<HTMLInputElement>("[main-field]")?.focus();
+}
+
+function searchPanel(): HTMLElement | null {
+  return findBar.querySelector<HTMLElement>(".cm-search") ?? editor.dom.querySelector<HTMLElement>(".cm-search");
 }
 
 /** The panel's next, previous, and Enter follow the whole book checkbox once the panel is open. */
 function wireBookFind(view: EditorView): void {
-  const panel = view.dom.querySelector<HTMLElement>(".cm-search");
+  const panel = searchPanel();
   if (bookFindWired(panel)) return;
   attachBookFind(panel, view);
 }
@@ -3291,7 +3331,7 @@ function inputParent(input: Element | null): Element | null {
 }
 
 function takeBookMatch(direction: "next" | "previous", event: Event): void {
-  if (!searchWholeBook) return;
+  if (!usesBookFind()) return;
   event.stopImmediatePropagation();
   event.preventDefault();
   void findInBook(direction);
@@ -3303,7 +3343,8 @@ function onBookFindKey(event: KeyboardEvent): void {
 }
 
 function ignoreBookFindKey(event: KeyboardEvent): boolean {
-  return !searchWholeBook || blockedFindKey(event);
+  if (blockedFindKey(event)) return true;
+  return !usesBookFind();
 }
 
 function blockedFindKey(event: KeyboardEvent): boolean {
@@ -3343,7 +3384,7 @@ function findBusy(): boolean {
 }
 
 function notSearching(): boolean {
-  return !editing() || book == null;
+  return book == null;
 }
 
 async function seekInBook(direction: "next" | "previous"): Promise<void> {
@@ -3358,21 +3399,39 @@ function showSearchPanel(): void {
 }
 
 async function seekValid(direction: "next" | "previous", query: SearchQuery): Promise<void> {
-  const current = selected();
-  if (!current) return;
-  await revealHit(direction, current, query);
-}
-
-async function revealHit(direction: "next" | "previous", current: Selection, query: SearchQuery): Promise<void> {
-  const hit = bookHit(direction, current.node.header.id, query);
+  const hit = bookHit(direction, query);
   if (!hit) return;
-  await showHit(hit, current.node.header.id, query);
+  await showHit(hit, selected()?.node.header.id ?? "", query);
 }
 
-function bookHit(direction: "next" | "previous", id: string, query: SearchQuery): FindHit | null {
-  const from = matchOrigin(direction);
-  if (direction === "next") return nextMatch(searchParts(), id, from, query);
-  return previousMatch(searchParts(), id, from, query);
+function bookHit(direction: "next" | "previous", query: SearchQuery): FindHit | null {
+  const origin = matchStart(direction);
+  if (direction === "next") return nextMatch(searchParts(), origin.id, origin.from, query);
+  return previousMatch(searchParts(), origin.id, origin.from, query);
+}
+
+function matchStart(direction: "next" | "previous"): { id: string; from: number } {
+  const kept = keptFind(direction);
+  if (kept) return kept;
+  const reading = readingFind(direction);
+  if (reading) return reading;
+  return { id: selected()?.node.header.id ?? "", from: matchOrigin(direction) };
+}
+
+function keptFind(direction: "next" | "previous"): { id: string; from: number } | null {
+  if (!foundAt || editing()) return null;
+  return { id: foundAt.id, from: direction === "next" ? foundAt.to : foundAt.from };
+}
+
+function readingFind(direction: "next" | "previous"): { id: string; from: number } | null {
+  if (editing()) return null;
+  const caret = readCaret(readingEl);
+  if (!caret) return null;
+  const id = sectionOf(caret.node)?.dataset.id;
+  if (!id) return null;
+  const from = Math.min(caret.anchor, caret.head);
+  const to = Math.max(caret.anchor, caret.head);
+  return { id, from: direction === "next" ? to : from };
 }
 
 function matchOrigin(direction: "next" | "previous"): number {
@@ -3381,12 +3440,66 @@ function matchOrigin(direction: "next" | "previous"): number {
 
 async function showHit(hit: FindHit, currentId: string, query: SearchQuery): Promise<void> {
   const fromPanel = searchFieldFocused();
-  if (hit.id !== currentId) await jumpToHit(hit, query, fromPanel);
+  rememberHit(hit);
+  if (showInReading(hit)) {
+    showReadingHit(hit, fromPanel);
+    return;
+  }
+  if (hit.id !== currentId || !editing()) await jumpToHit(hit, query, fromPanel);
   else showLocalHit(hit, fromPanel);
 }
 
+function rememberHit(hit: FindHit): void {
+  foundAt = { id: hit.id, from: hit.from, to: hit.to };
+}
+
+function clearFound(): void {
+  foundAt = null;
+  CSS.highlights?.delete("find-hit");
+}
+
+function showInReading(hit: FindHit): boolean {
+  return !editing() && readingSection(hit.id) != null;
+}
+
+function readingSection(id: string): HTMLElement | null {
+  return readingEl.querySelector<HTMLElement>(`section[data-id="${CSS.escape(id)}"]`);
+}
+
+function showReadingHit(hit: FindHit, fromPanel: boolean): void {
+  const section = readingSection(hit.id);
+  if (!section) return;
+  markReadingHit(section, hit.from, hit.to);
+  if (fromPanel) focusSearch();
+}
+
+function markReadingHit(section: HTMLElement, from: number, to: number): void {
+  const range = sourceRange(section, from, to);
+  if (!range) {
+    section.scrollIntoView({ block: "nearest" });
+    return;
+  }
+  paintFindHit(range);
+  reveal(range.startContainer.parentElement);
+}
+
+function sourceRange(root: HTMLElement, from: number, to: number): Range | null {
+  const start = caretSpot(root, from);
+  const end = caretSpot(root, to);
+  if (!start || !end) return null;
+  const range = root.ownerDocument.createRange();
+  range.setStart(start.node, start.offset);
+  range.setEnd(end.node, end.offset);
+  return range;
+}
+
+function paintFindHit(range: Range): void {
+  if (!CSS.highlights || typeof Highlight === "undefined") return;
+  CSS.highlights.set("find-hit", new Highlight(range));
+}
+
 function searchFieldFocused(): boolean {
-  return elementContains(editor.dom.querySelector(".cm-search"), document.activeElement);
+  return elementContains(searchPanel(), document.activeElement);
 }
 
 function elementContains(panel: Element | null, active: Element | null): boolean {
@@ -3697,6 +3810,9 @@ readingEl.addEventListener("click", (event) => {
   if (followFootnote(readingEl, event)) return;
   keepLink(event);
   focusRendered(readingEl);
+});
+readingEl.addEventListener("pointerdown", () => {
+  clearFound();
 });
 
 function focusRendered(root: HTMLElement): void {
@@ -4243,7 +4359,26 @@ paletteInput.addEventListener("keydown", (event) => {
   } else if (event.key === "Escape") closePalette();
 });
 
+function findShortcut(event: KeyboardEvent): boolean {
+  if (event.defaultPrevented || event.altKey || !metaOrCtrl(event)) return false;
+  return runFindShortcut(event);
+}
+
+function runFindShortcut(event: KeyboardEvent): boolean {
+  const key = event.key.toLowerCase();
+  if (key === "f" && !event.shiftKey) {
+    event.preventDefault();
+    openFind();
+    return true;
+  }
+  if (key !== "g") return false;
+  event.preventDefault();
+  goToMatch(event.shiftKey ? "previous" : "next");
+  return true;
+}
+
 document.addEventListener("keydown", (event) => {
+  if (findShortcut(event)) return;
   const meta = event.metaKey || event.ctrlKey;
   if (meta && event.key.toLowerCase() === "k") {
     event.preventDefault();
@@ -4254,6 +4389,7 @@ document.addEventListener("keydown", (event) => {
     dirty = true;
     void flush();
   } else if (event.key === "Escape") {
+    if (!event.defaultPrevented) dismissFind(editor);
     reminder.hidden = true;
     closeContextMenu();
   }

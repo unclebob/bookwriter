@@ -144,7 +144,7 @@ The editor shows Markdown source. The characters in the editor are the character
 
 The marks stay visible. Highlighting shows a heading line as a heading and a fenced block as code, with the `#` and the backticks still on screen.
 
-Find searches the open text. The find panel has a whole book checkbox beside match case, regexp, and by word. With that checked, Find Next and Find Previous continue through the other texts in tree order and open the text that holds the match. The trash is left out. The search wraps around the manuscript. Replace keeps working in the open text. A successful Find Next or Find Previous scrolls the preview to the match.
+Find searches the open text. On the reading view it searches the texts on that screen and scrolls to the match. The find panel has a whole book checkbox beside match case, regexp, and by word. With that checked, Find Next and Find Previous continue through the other texts in tree order and open the text that holds the match. The trash is left out. The search wraps around the manuscript. Replace keeps working in the open text. A successful Find Next or Find Previous scrolls the preview to the match.
 
 ## Preview
 
